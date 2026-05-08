@@ -1,0 +1,17 @@
+# Credentials — NEVER commit these
+.env
+*.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
+bot_log.txt
+
+# OS
+.DS_Store
+Thumbs.db
