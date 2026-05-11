@@ -52,14 +52,16 @@ PAPER_TRADING = True
 # ============================================================
 WATCHLIST = [
     "NFLX",   # Netflix
+    "TSLA",   # Tesla
+    "X",      # U.S. Steel
 ]
 
 # 均線參數
 SHORT_MA = 5
 LONG_MA  = 20
 
-# 固定交易股數
-SHARES_PER_TRADE = 10
+# 每筆交易本金上限（USD）— 買入股數 = int(CAPITAL_PER_TRADE / 當前股價)
+CAPITAL_PER_TRADE = 10_000
 
 # 滾動止損：從持倉峰值回落超過此比例即平倉
 TRAILING_STOP_PCT = 0.02   # 2%
@@ -353,7 +355,8 @@ def run_strategy(trading_client: TradingClient, data_client: StockHistoricalData
                 )
                 if tv["bullish"]:
                     current_price = get_latest_price(data_client, symbol) or closes.iloc[-1]
-                    place_order(trading_client, symbol, OrderSide.BUY, SHARES_PER_TRADE, current_price, "TV+MA雙確認買入")
+                    qty = max(1, int(CAPITAL_PER_TRADE / current_price))
+                    place_order(trading_client, symbol, OrderSide.BUY, qty, current_price, "TV+MA雙確認買入")
                     _position_peaks[symbol] = current_price  # 初始化峰值
 
             # 4. 賣出邏輯：MA 死叉
@@ -421,9 +424,11 @@ def trial_run():
 
     # 3. 模擬下單與持倉
     _paper_positions.clear()
-    place_order(None, "NFLX", OrderSide.BUY,  10, 700.0, "試跑買入", trial=True)
-    assert _paper_positions["NFLX"]["quantity"] == 10
-    place_order(None, "NFLX", OrderSide.SELL, 10, 720.0, "試跑賣出", trial=True)
+    test_price = 700.0
+    test_qty   = max(1, int(CAPITAL_PER_TRADE / test_price))  # 10000/700 = 14
+    place_order(None, "NFLX", OrderSide.BUY,  test_qty, test_price, "試跑買入", trial=True)
+    assert _paper_positions["NFLX"]["quantity"] == test_qty
+    place_order(None, "NFLX", OrderSide.SELL, test_qty, 720.0, "試跑賣出", trial=True)
     assert _paper_positions["NFLX"]["quantity"] == 0
     log.info("持倉模擬測試通過")
 
@@ -443,7 +448,8 @@ def trial_run():
              tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"], tv["exchange"])
 
     log.info("====== Trial Run 全部通過 ✓（V2）======")
-    log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%%", PAPER_TRADING, TRAILING_STOP_PCT * 100)
+    log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%% | CAPITAL_PER_TRADE = $%d",
+             PAPER_TRADING, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
 
 # ----------------------------------------------------------
@@ -457,7 +463,8 @@ def main():
         sys.exit(1)
 
     log.info("=== Alpaca Trading Bot V2 ===")
-    log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%%", PAPER_TRADING, TRAILING_STOP_PCT * 100)
+    log.info("PAPER_TRADING = %s | 滾動止損 = %.0f%% | 每筆本金 = $%d",
+             PAPER_TRADING, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
     log.info("監控清單: %s", WATCHLIST)
 
     trading_client = TradingClient(api_key, api_secret, paper=PAPER_TRADING)
