@@ -1,18 +1,19 @@
 """
-Alpaca 自動交易機器人
-雙均線策略（5日線 / 20日線）+ 2% 止損風控
+Alpaca 自動交易機器人 — V2
+雙均線策略（5日線 / 20日線）
++ TradingView 技術評級雙重確認
++ 2% 滾動止損（Trailing Stop Loss）
 
 環境變數設定（建議儲存於 .env 檔案）：
   ALPACA_API_KEY    = 您的 API Key ID
   ALPACA_API_SECRET = 您的 API Secret Key
 
 安裝指令：
-  pip install alpaca-py pandas numpy python-dotenv
+  pip install alpaca-py pandas numpy python-dotenv tradingview_ta
 
 使用說明：
-  1. 設定 PAPER_TRADING = True（Alpaca 模擬帳戶）或 False（實盤）
-  2. 在 WATCHLIST 加入要監控的美股代碼
-  3. 執行：python alpaca_trading_bot.py
+  python -X utf8 alpaca_trading_bot.py          # 試跑驗證
+  python -X utf8 alpaca_trading_bot.py --live   # 連線 Alpaca
 """
 
 import os
@@ -28,7 +29,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv 非強制，可手動設定環境變數
+    pass
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
@@ -37,29 +38,31 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
 from alpaca.data.timeframe import TimeFrame
 
+from tradingview_ta import TA_Handler, Interval
+
 # ============================================================
 # ⚠️  模式切換
-#   True  = 使用 Alpaca Paper Trading 帳戶（模擬，安全預設值）
-#   False = 使用 Alpaca 真實帳戶（實盤，有真實資金風險！）
+#   True  = Alpaca Paper Trading（模擬，安全預設值）
+#   False = Alpaca 真實帳戶（實盤，有真實資金風險！）
 # ============================================================
 PAPER_TRADING = True
 
 # ============================================================
-# 監控股票清單（美股代碼，不加後綴）
+# 監控股票清單（美股代碼）
 # ============================================================
 WATCHLIST = [
     "NFLX",   # Netflix
 ]
 
 # 均線參數
-SHORT_MA = 5   # 短期均線（天）
-LONG_MA  = 20  # 長期均線（天）
+SHORT_MA = 5
+LONG_MA  = 20
 
-# 固定交易股數（整股，不使用槓桿）
+# 固定交易股數
 SHARES_PER_TRADE = 10
 
-# 風控：單筆虧損超過此比例即市價平倉
-STOP_LOSS_PCT = 0.02
+# 滾動止損：從持倉峰值回落超過此比例即平倉
+TRAILING_STOP_PCT = 0.02   # 2%
 
 # 輪詢間隔（秒）
 POLL_INTERVAL = 60
@@ -74,6 +77,8 @@ log = logging.getLogger(__name__)
 
 # 試跑模式用的記憶體持倉
 _paper_positions: dict[str, dict] = {}
+# 各持倉的歷史最高價（用於滾動止損）
+_position_peaks: dict[str, float] = {}
 
 
 # ----------------------------------------------------------
@@ -83,13 +88,51 @@ def calc_fee(price: float, quantity: int, is_sell: bool) -> dict:
     """Alpaca 零佣金，賣出時有 SEC 費與 FINRA TAF"""
     sec_fee   = round(price * quantity * 0.0000278, 4) if is_sell else 0.0
     finra_taf = round(min(8.30, quantity * 0.000166), 4) if is_sell else 0.0
-    total     = round(sec_fee + finra_taf, 4)
     return {
-        "佣金":       0.0,
-        "SEC費":      sec_fee,
-        "FINRA_TAF":  finra_taf,
-        "合計費用":   total,
+        "佣金":     0.0,
+        "SEC費":    sec_fee,
+        "FINRA_TAF": finra_taf,
+        "合計費用": round(sec_fee + finra_taf, 4),
     }
+
+
+# ----------------------------------------------------------
+# TradingView 技術分析評級
+# ----------------------------------------------------------
+def analyse_stock(symbol: str) -> dict:
+    """
+    抓取 TradingView 日線技術分析評級。
+    依序嘗試 NASDAQ → NYSE，兩者皆失敗則回傳 UNKNOWN。
+    回傳：
+      tv_rating    : 'STRONG_BUY' / 'BUY' / 'NEUTRAL' / 'SELL' / 'STRONG_SELL' / 'UNKNOWN'
+      tv_buy_count : 買入指標數量
+      tv_sell_count: 賣出指標數量
+      bullish      : True = 通過評級篩選（BUY 或 STRONG_BUY）
+    """
+    for exchange in ("NASDAQ", "NYSE", "AMEX"):
+        try:
+            handler = TA_Handler(
+                symbol=symbol,
+                screener="america",
+                exchange=exchange,
+                interval=Interval.INTERVAL_1_DAY,
+            )
+            analysis  = handler.get_analysis()
+            rec       = analysis.summary["RECOMMENDATION"]
+            buy_count = analysis.summary["BUY"]
+            sell_count = analysis.summary["SELL"]
+            return {
+                "tv_rating":     rec,
+                "tv_buy_count":  buy_count,
+                "tv_sell_count": sell_count,
+                "bullish":       rec in ("BUY", "STRONG_BUY"),
+                "exchange":      exchange,
+            }
+        except Exception:
+            continue
+
+    log.warning("%s 無法取得 TradingView 評級，預設 UNKNOWN", symbol)
+    return {"tv_rating": "UNKNOWN", "tv_buy_count": 0, "tv_sell_count": 0, "bullish": False, "exchange": "N/A"}
 
 
 # ----------------------------------------------------------
@@ -102,7 +145,7 @@ def get_historical_closes(
 ) -> pd.Series:
     """抓取最近 N 個交易日的收盤價"""
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=days + 30)  # 多抓以防節假日
+    start = end - timedelta(days=days + 30)
     req   = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
@@ -111,14 +154,10 @@ def get_historical_closes(
     )
     bars = data_client.get_stock_bars(req)
     df   = bars.df
-
     if df.empty:
         return pd.Series(dtype=float)
-
-    # bars.df 索引為 MultiIndex (symbol, timestamp)
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level="symbol")
-
     return df["close"].sort_index().tail(days)
 
 
@@ -127,20 +166,16 @@ def get_historical_closes(
 # ----------------------------------------------------------
 def compute_signal(closes: pd.Series) -> str:
     """
-    回傳交叉信號：
-      'BUY'  - 5日線上穿20日線（金叉）
-      'SELL' - 5日線下穿20日線（死叉）
-      'HOLD' - 無訊號
+    BUY  — 5日線上穿20日線（金叉）
+    SELL — 5日線下穿20日線（死叉）
+    HOLD — 無訊號
     """
     if len(closes) < LONG_MA + 1:
         return "HOLD"
-
     ma_short = closes.rolling(SHORT_MA).mean()
     ma_long  = closes.rolling(LONG_MA).mean()
-
     prev_short, curr_short = ma_short.iloc[-2], ma_short.iloc[-1]
     prev_long,  curr_long  = ma_long.iloc[-2],  ma_long.iloc[-1]
-
     if prev_short <= prev_long and curr_short > curr_long:
         return "BUY"
     if prev_short >= prev_long and curr_short < curr_long:
@@ -156,7 +191,6 @@ def get_current_position(
     symbol: str,
     trial: bool = False,
 ) -> dict:
-    """取得目前持倉（試跑從記憶體查，連線模式從 Alpaca API 查）"""
     if trial:
         return _paper_positions.get(symbol, {"quantity": 0, "avg_cost": 0.0})
     try:
@@ -167,6 +201,19 @@ def get_current_position(
         }
     except Exception:
         return {"quantity": 0, "avg_cost": 0.0}
+
+
+# ----------------------------------------------------------
+# 即時報價
+# ----------------------------------------------------------
+def get_latest_price(data_client: StockHistoricalDataClient, symbol: str) -> float | None:
+    try:
+        req    = StockLatestBarRequest(symbol_or_symbols=[symbol])
+        latest = data_client.get_stock_latest_bar(req)
+        return float(latest[symbol].close)
+    except Exception as e:
+        log.warning("%s 取得即時報價失敗：%s", symbol, e)
+        return None
 
 
 # ----------------------------------------------------------
@@ -181,7 +228,6 @@ def place_order(
     reason: str = "",
     trial: bool = False,
 ):
-    """提交訂單（試跑 / Paper / 實盤，由初始化設定決定路由）"""
     fee_info   = calc_fee(price, quantity, is_sell=(side == OrderSide.SELL))
     mode_label = "試跑" if trial else ("Paper" if PAPER_TRADING else "實盤")
 
@@ -190,11 +236,14 @@ def place_order(
         mode_label, side.value.upper(), symbol, quantity, price, fee_info, reason,
     )
 
+    # 賣出時清除峰值記錄
+    if side == OrderSide.SELL:
+        _position_peaks.pop(symbol, None)
+
     if trial:
-        # 純記憶體模擬，不呼叫任何 API
         pos = _paper_positions.get(symbol, {"quantity": 0, "avg_cost": 0.0})
         if side == OrderSide.BUY:
-            total_cost   = pos["avg_cost"] * pos["quantity"] + price * quantity
+            total_cost  = pos["avg_cost"] * pos["quantity"] + price * quantity
             pos["quantity"] += quantity
             pos["avg_cost"] = total_cost / pos["quantity"] if pos["quantity"] else 0.0
         else:
@@ -205,7 +254,6 @@ def place_order(
         log.info("[試跑] 持倉更新 %s: %s", symbol, pos)
         return
 
-    # 送出 Alpaca 市價單（paper=True 自動路由至模擬帳戶）
     order_req = MarketOrderRequest(
         symbol=symbol,
         qty=quantity,
@@ -217,36 +265,50 @@ def place_order(
 
 
 # ----------------------------------------------------------
-# 風控：止損檢查
+# 滾動止損
 # ----------------------------------------------------------
-def check_stop_loss(
+def update_trailing_stop(
     trading_client: TradingClient | None,
     data_client: StockHistoricalDataClient | None,
     symbol: str,
     trial: bool = False,
 ):
-    """若當前虧損超過 2%，立即市價平倉"""
+    """
+    追蹤持倉峰值，若當前價從峰值回落 >= TRAILING_STOP_PCT 則平倉。
+    試跑模式下跳過（無即時報價）。
+    """
     pos = get_current_position(trading_client, symbol, trial=trial)
-    if pos["quantity"] <= 0 or pos["avg_cost"] <= 0:
+    if pos["quantity"] <= 0:
+        _position_peaks.pop(symbol, None)
         return
 
     if trial:
-        return  # 試跑模式無即時報價，跳過
-
-    try:
-        req           = StockLatestBarRequest(symbol_or_symbols=[symbol])
-        latest        = data_client.get_stock_latest_bar(req)
-        current_price = float(latest[symbol].close)
-    except Exception as e:
-        log.warning("%s 取得即時報價失敗：%s", symbol, e)
         return
 
-    loss_pct = (pos["avg_cost"] - current_price) / pos["avg_cost"]
-    if loss_pct >= STOP_LOSS_PCT:
+    current_price = get_latest_price(data_client, symbol)
+    if current_price is None:
+        return
+
+    # 更新峰值
+    peak = _position_peaks.get(symbol, current_price)
+    if current_price > peak:
+        peak = current_price
+        _position_peaks[symbol] = peak
+        log.info("%s 峰值更新：$%.4f", symbol, peak)
+
+    # 計算回撤
+    drawdown = (peak - current_price) / peak
+    log.info(
+        "%s 滾動止損監控：當前 $%.4f | 峰值 $%.4f | 回撤 %.2f%%（門檻 %.0f%%）",
+        symbol, current_price, peak, drawdown * 100, TRAILING_STOP_PCT * 100,
+    )
+
+    if drawdown >= TRAILING_STOP_PCT:
         log.warning(
-            "[風控] %s 虧損 %.2f%% 超過門檻，觸發止損平倉！", symbol, loss_pct * 100
+            "[滾動止損] %s 從峰值 $%.4f 回落 %.2f%%，觸發平倉！",
+            symbol, peak, drawdown * 100,
         )
-        place_order(trading_client, symbol, OrderSide.SELL, pos["quantity"], current_price, "止損平倉")
+        place_order(trading_client, symbol, OrderSide.SELL, pos["quantity"], current_price, "滾動止損平倉")
 
 
 # ----------------------------------------------------------
@@ -254,12 +316,12 @@ def check_stop_loss(
 # ----------------------------------------------------------
 def run_strategy(trading_client: TradingClient, data_client: StockHistoricalDataClient):
     """對 WATCHLIST 中每支股票執行一次策略判斷"""
-    # 市場休市時跳過（避免送出無法成交的 DAY 訂單）
     try:
         clock = trading_client.get_clock()
     except Exception as e:
         log.warning("取得市場時鐘失敗，跳過本次輪詢：%s", e)
         return
+
     if not clock.is_open:
         log.info("市場休市，下次開盤：%s", clock.next_open.strftime("%Y-%m-%d %H:%M %Z"))
         return
@@ -268,125 +330,120 @@ def run_strategy(trading_client: TradingClient, data_client: StockHistoricalData
         try:
             log.info("--- 處理 %s ---", symbol)
 
-            # 止損檢查（優先執行）
-            check_stop_loss(trading_client, data_client, symbol)
+            # 1. 滾動止損檢查（優先執行）
+            update_trailing_stop(trading_client, data_client, symbol)
 
-            # 抓歷史收盤價
+            # 2. 抓歷史收盤價 + 均線信號
             closes = get_historical_closes(data_client, symbol, LONG_MA + 5)
             if closes.empty:
                 log.warning("%s 無法取得歷史行情，跳過", symbol)
                 continue
 
-            signal = compute_signal(closes)
-            log.info("%s 均線信號：%s（最新收盤 %.4f）", symbol, signal, closes.iloc[-1])
+            ma_signal = compute_signal(closes)
+            pos       = get_current_position(trading_client, symbol)
 
-            pos = get_current_position(trading_client, symbol)
+            # 3. 買入邏輯：MA 金叉 + TV 評級雙重確認
+            if ma_signal == "BUY" and pos["quantity"] == 0:
+                tv      = analyse_stock(symbol)
+                decision = "✅ 允許入市" if tv["bullish"] else "❌ 評級不足，跳過"
+                log.info(
+                    "[分析] %s | TV評級: %s (買:%d 賣:%d) | MA信號: %s | 決策: %s",
+                    symbol, tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"],
+                    ma_signal, decision,
+                )
+                if tv["bullish"]:
+                    current_price = get_latest_price(data_client, symbol) or closes.iloc[-1]
+                    place_order(trading_client, symbol, OrderSide.BUY, SHARES_PER_TRADE, current_price, "TV+MA雙確認買入")
+                    _position_peaks[symbol] = current_price  # 初始化峰值
 
-            if signal == "BUY" and pos["quantity"] == 0:
-                req           = StockLatestBarRequest(symbol_or_symbols=[symbol])
-                latest        = data_client.get_stock_latest_bar(req)
-                current_price = float(latest[symbol].close)
-                place_order(trading_client, symbol, OrderSide.BUY, SHARES_PER_TRADE, current_price, "均線金叉買入")
-
-            elif signal == "SELL" and pos["quantity"] > 0:
-                req           = StockLatestBarRequest(symbol_or_symbols=[symbol])
-                latest        = data_client.get_stock_latest_bar(req)
-                current_price = float(latest[symbol].close)
+            # 4. 賣出邏輯：MA 死叉
+            elif ma_signal == "SELL" and pos["quantity"] > 0:
+                log.info("[分析] %s | MA信號: SELL | 決策: ✅ 均線死叉平倉", symbol)
+                current_price = get_latest_price(data_client, symbol) or closes.iloc[-1]
                 place_order(trading_client, symbol, OrderSide.SELL, pos["quantity"], current_price, "均線死叉賣出")
 
             else:
-                log.info("%s 無操作（信號=%s，持倉=%d）", symbol, signal, pos["quantity"])
+                log.info("%s 無操作（MA信號=%s，持倉=%d）", symbol, ma_signal, pos["quantity"])
 
         except Exception as exc:
             log.error("%s 處理出錯：%s", symbol, exc, exc_info=True)
 
 
 # ----------------------------------------------------------
-# 試跑驗證（不需要 API Key 即可確認各元件正常）
-# ----------------------------------------------------------
-def trial_run():
-    """驗證費用計算、均線邏輯、持倉模擬、止損觸發等核心元件"""
-    log.info("====== Trial Run 開始 ======")
-
-    # 1. 費用計算
-    buy_fee  = calc_fee(price=150.0, quantity=10, is_sell=False)
-    sell_fee = calc_fee(price=155.0, quantity=10, is_sell=True)
-    log.info("買入費用（10 股 @ $150）: %s", buy_fee)
-    log.info("賣出費用（10 股 @ $155）: %s", sell_fee)
-    assert buy_fee["合計費用"] == 0.0,  "買入不應有費用"
-    assert sell_fee["合計費用"] > 0.0,  "賣出應有監管費用"
-
-    # 2. 均線信號（用假資料）
-    np.random.seed(42)
-    rising = pd.Series(
-        [100 + i * 0.5 + np.random.randn() * 2 for i in range(30)],
-        index=pd.date_range(end=datetime.today(), periods=30).date,
-    )
-    signal1 = compute_signal(rising)
-    log.info("上升假資料均線信號: %s", signal1)
-
-    declining = pd.Series(
-        [100 - i * 0.5 + np.random.randn() * 1 for i in range(30)],
-        index=pd.date_range(end=datetime.today(), periods=30).date,
-    )
-    signal2 = compute_signal(declining)
-    log.info("下跌假資料均線信號: %s", signal2)
-
-    # 3. 模擬下單與持倉更新
-    _paper_positions.clear()
-    place_order(None, "AAPL", OrderSide.BUY,  10, 150.0, "試跑買入", trial=True)
-    assert _paper_positions["AAPL"]["quantity"] == 10,  "買入後持倉應為 10"
-    place_order(None, "AAPL", OrderSide.SELL, 10, 155.0, "試跑賣出", trial=True)
-    assert _paper_positions["AAPL"]["quantity"] == 0,   "賣出後持倉應為 0"
-    log.info("持倉模擬測試通過")
-
-    # 4. 止損觸發邏輯
-    _paper_positions["AAPL"] = {"quantity": 10, "avg_cost": 150.0}
-    pos           = _paper_positions["AAPL"]
-    current_price = 145.5   # 模擬虧損 3%
-    loss_pct      = (pos["avg_cost"] - current_price) / pos["avg_cost"]
-    triggered     = loss_pct >= STOP_LOSS_PCT
-    log.info("止損觸發測試：虧損 %.2f%%，應觸發 True -> %s", loss_pct * 100, triggered)
-    assert triggered, "止損邏輯錯誤！"
-
-    log.info("====== Trial Run 全部通過 ✓ ======")
-    log.info("")
-    log.info("提示：若要連接 Alpaca API，請設定以下環境變數後執行 main()：")
-    log.info("  ALPACA_API_KEY    = <您的 API Key ID>")
-    log.info("  ALPACA_API_SECRET = <您的 API Secret Key>")
-    log.info("  目前模式：PAPER_TRADING = %s", PAPER_TRADING)
-
-
-# ----------------------------------------------------------
 # 結算報告
 # ----------------------------------------------------------
 def _print_summary(trading_client: TradingClient):
-    """Print end-of-session P&L summary for each watched symbol."""
     log.info("=" * 60)
     log.info("TRADING SESSION SUMMARY")
     log.info("=" * 60)
     try:
         account = trading_client.get_account()
-        log.info("Account status : %s", account.status)
-        log.info("Equity         : $%s", account.equity)
-        log.info("Buying power   : $%s", account.buying_power)
-        log.info("Realized P&L   : $%s", account.realized_pl if hasattr(account, 'realized_pl') else "N/A")
-        log.info("Unrealized P&L : $%s", account.unrealized_pl if hasattr(account, 'unrealized_pl') else "N/A")
+        log.info("帳戶狀態   : %s", account.status)
+        log.info("淨值       : $%s", account.equity)
+        log.info("可用資金   : $%s", account.buying_power)
     except Exception as e:
-        log.warning("Could not fetch account summary: %s", e)
-
+        log.warning("無法取得帳戶摘要：%s", e)
     log.info("-" * 60)
     for symbol in WATCHLIST:
         try:
             pos = trading_client.get_open_position(symbol)
             log.info(
-                "%s  qty=%s  avg_cost=$%s  current=$%s  unrealized_pl=$%s",
+                "%s  數量=%s  平均成本=$%s  現價=$%s  未實現損益=$%s",
                 symbol, pos.qty, pos.avg_entry_price,
                 pos.current_price, pos.unrealized_pl,
             )
         except Exception:
-            log.info("%s  no open position", symbol)
+            log.info("%s  無持倉", symbol)
     log.info("=" * 60)
+
+
+# ----------------------------------------------------------
+# 試跑驗證
+# ----------------------------------------------------------
+def trial_run():
+    log.info("====== Trial Run 開始（V2）======")
+
+    # 1. 費用計算
+    buy_fee  = calc_fee(150.0, 10, is_sell=False)
+    sell_fee = calc_fee(155.0, 10, is_sell=True)
+    log.info("買入費用: %s", buy_fee)
+    log.info("賣出費用: %s", sell_fee)
+    assert buy_fee["合計費用"] == 0.0
+    assert sell_fee["合計費用"] > 0.0
+
+    # 2. 均線信號
+    np.random.seed(42)
+    rising = pd.Series(
+        [100 + i * 0.5 + np.random.randn() * 2 for i in range(30)],
+        index=pd.date_range(end=datetime.today(), periods=30).date,
+    )
+    log.info("上升假資料均線信號: %s", compute_signal(rising))
+
+    # 3. 模擬下單與持倉
+    _paper_positions.clear()
+    place_order(None, "NFLX", OrderSide.BUY,  10, 700.0, "試跑買入", trial=True)
+    assert _paper_positions["NFLX"]["quantity"] == 10
+    place_order(None, "NFLX", OrderSide.SELL, 10, 720.0, "試跑賣出", trial=True)
+    assert _paper_positions["NFLX"]["quantity"] == 0
+    log.info("持倉模擬測試通過")
+
+    # 4. 滾動止損邏輯
+    _position_peaks["NFLX"] = 750.0
+    peak          = _position_peaks["NFLX"]
+    current_price = 732.0   # 模擬回撤 2.4%
+    drawdown      = (peak - current_price) / peak
+    triggered     = drawdown >= TRAILING_STOP_PCT
+    log.info("滾動止損測試：回撤 %.2f%%，應觸發 True -> %s", drawdown * 100, triggered)
+    assert triggered, "滾動止損邏輯錯誤！"
+
+    # 5. TradingView 評級（live 網路測試）
+    log.info("測試 TradingView 評級（需要網路）…")
+    tv = analyse_stock("NFLX")
+    log.info("NFLX TV評級: %s (買:%d 賣:%d) 交易所:%s",
+             tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"], tv["exchange"])
+
+    log.info("====== Trial Run 全部通過 ✓（V2）======")
+    log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%%", PAPER_TRADING, TRAILING_STOP_PCT * 100)
 
 
 # ----------------------------------------------------------
@@ -395,12 +452,12 @@ def _print_summary(trading_client: TradingClient):
 def main():
     api_key    = os.getenv("ALPACA_API_KEY")
     api_secret = os.getenv("ALPACA_API_SECRET")
-
     if not api_key or not api_secret:
-        log.error("請設定環境變數 ALPACA_API_KEY 與 ALPACA_API_SECRET（或建立 .env 檔案）")
+        log.error("請設定環境變數 ALPACA_API_KEY 與 ALPACA_API_SECRET")
         sys.exit(1)
 
-    log.info("PAPER_TRADING = %s", PAPER_TRADING)
+    log.info("=== Alpaca Trading Bot V2 ===")
+    log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%%", PAPER_TRADING, TRAILING_STOP_PCT * 100)
     log.info("監控清單: %s", WATCHLIST)
 
     trading_client = TradingClient(api_key, api_secret, paper=PAPER_TRADING)
@@ -409,9 +466,10 @@ def main():
     account = trading_client.get_account()
     log.info("帳戶狀態：%s | 可用資金：$%s", account.status, account.buying_power)
 
-    run_duration = 7200  # 2 hours
-    end_time = time.time() + run_duration
-    log.info("已連線至 Alpaca API，開始策略輪詢（每 %d 秒），執行時間：2 小時…", POLL_INTERVAL)
+    run_duration = 7200  # 2 小時
+    end_time     = time.time() + run_duration
+    log.info("開始策略輪詢（每 %d 秒），執行時間：2 小時…", POLL_INTERVAL)
+
     try:
         while time.time() < end_time:
             try:
@@ -430,7 +488,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # 預設執行試跑驗證；帶 --live 參數則連接真實 Alpaca API
     if "--live" in sys.argv:
         main()
     else:
