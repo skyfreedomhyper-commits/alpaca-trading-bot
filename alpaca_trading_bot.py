@@ -48,10 +48,7 @@ PAPER_TRADING = True
 # 監控股票清單（美股代碼，不加後綴）
 # ============================================================
 WATCHLIST = [
-    "AAPL",   # 蘋果
-    "MSFT",   # 微軟
-    "TSLA",   # 特斯拉
-    "NVDA",   # 輝達
+    "NFLX",   # Netflix
 ]
 
 # 均線參數
@@ -258,7 +255,11 @@ def check_stop_loss(
 def run_strategy(trading_client: TradingClient, data_client: StockHistoricalDataClient):
     """對 WATCHLIST 中每支股票執行一次策略判斷"""
     # 市場休市時跳過（避免送出無法成交的 DAY 訂單）
-    clock = trading_client.get_clock()
+    try:
+        clock = trading_client.get_clock()
+    except Exception as e:
+        log.warning("取得市場時鐘失敗，跳過本次輪詢：%s", e)
+        return
     if not clock.is_open:
         log.info("市場休市，下次開盤：%s", clock.next_open.strftime("%Y-%m-%d %H:%M %Z"))
         return
@@ -357,6 +358,38 @@ def trial_run():
 
 
 # ----------------------------------------------------------
+# 結算報告
+# ----------------------------------------------------------
+def _print_summary(trading_client: TradingClient):
+    """Print end-of-session P&L summary for each watched symbol."""
+    log.info("=" * 60)
+    log.info("TRADING SESSION SUMMARY")
+    log.info("=" * 60)
+    try:
+        account = trading_client.get_account()
+        log.info("Account status : %s", account.status)
+        log.info("Equity         : $%s", account.equity)
+        log.info("Buying power   : $%s", account.buying_power)
+        log.info("Realized P&L   : $%s", account.realized_pl if hasattr(account, 'realized_pl') else "N/A")
+        log.info("Unrealized P&L : $%s", account.unrealized_pl if hasattr(account, 'unrealized_pl') else "N/A")
+    except Exception as e:
+        log.warning("Could not fetch account summary: %s", e)
+
+    log.info("-" * 60)
+    for symbol in WATCHLIST:
+        try:
+            pos = trading_client.get_open_position(symbol)
+            log.info(
+                "%s  qty=%s  avg_cost=$%s  current=$%s  unrealized_pl=$%s",
+                symbol, pos.qty, pos.avg_entry_price,
+                pos.current_price, pos.unrealized_pl,
+            )
+        except Exception:
+            log.info("%s  no open position", symbol)
+    log.info("=" * 60)
+
+
+# ----------------------------------------------------------
 # 進入點
 # ----------------------------------------------------------
 def main():
@@ -376,13 +409,24 @@ def main():
     account = trading_client.get_account()
     log.info("帳戶狀態：%s | 可用資金：$%s", account.status, account.buying_power)
 
-    log.info("已連線至 Alpaca API，開始策略輪詢（每 %d 秒）…", POLL_INTERVAL)
+    run_duration = 7200  # 2 hours
+    end_time = time.time() + run_duration
+    log.info("已連線至 Alpaca API，開始策略輪詢（每 %d 秒），執行時間：2 小時…", POLL_INTERVAL)
     try:
-        while True:
-            run_strategy(trading_client, data_client)
-            time.sleep(POLL_INTERVAL)
+        while time.time() < end_time:
+            try:
+                run_strategy(trading_client, data_client)
+            except Exception as e:
+                log.error("策略輪詢出錯（將在 %d 秒後重試）：%s", POLL_INTERVAL, e)
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(POLL_INTERVAL, remaining))
     except KeyboardInterrupt:
         log.info("使用者中斷，程式結束。")
+
+    log.info("2 小時交易結束，生成結算報告…")
+    _print_summary(trading_client)
 
 
 if __name__ == "__main__":
