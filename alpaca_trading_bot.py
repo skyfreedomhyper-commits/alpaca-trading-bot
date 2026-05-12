@@ -77,7 +77,7 @@ CAPITAL_PER_TRADE = 10_000
 TRAILING_STOP_PCT = 0.02   # 2%
 
 # 輪詢間隔（秒）
-POLL_INTERVAL = 60
+POLL_INTERVAL = 15
 
 # ============================================================
 # 開市前自動選股設定

@@ -138,7 +138,7 @@ CAPITAL_PER_CRYPTO_TRADE = 1_000    # USD per crypto trade
 TRAILING_STOP_PCT = 0.02   # 2% trailing stop from position peak
 
 # ── POLL INTERVALS ─────────────────────────────────────────
-POLL_INTERVAL        = 60    # Seconds between stock strategy checks
+POLL_INTERVAL        = 15    # Seconds between stock strategy checks
 CRYPTO_POLL_INTERVAL = 300   # Seconds between crypto strategy checks (5 min)
 ```
 
@@ -205,7 +205,7 @@ Stop the bot at any time with **Ctrl + C**.
 ### Stock Strategy (Market Hours Only)
 
 ```
-Every 60 seconds for each symbol in WATCHLIST ∪ held stock positions:
+Every 15 seconds for each symbol in WATCHLIST ∪ held stock positions:
   │
   ├─ 1. Market hours check
   │       US market closed → sleep until next open
@@ -298,7 +298,7 @@ Before each market open, the bot runs `screen_stocks()` which:
 
 V4 ensures positions are never abandoned:
 
-- **Stock**: If you hold TSLA but the screener drops it from WATCHLIST, TSLA is still monitored every 60 seconds. The trailing stop and death-cross sell logic run normally. A new buy will NOT be triggered (only watchlist symbols can generate buys).
+- **Stock**: If you hold TSLA but the screener drops it from WATCHLIST, TSLA is still monitored every 15 seconds. The trailing stop and death-cross sell logic run normally. A new buy will NOT be triggered (only watchlist symbols can generate buys).
 - **Crypto**: Same logic — held crypto not in CRYPTO_WATCHLIST remains monitored for trailing stop and death cross.
 
 ```
@@ -398,7 +398,7 @@ All activity is written to **`bot_log.txt`** (overwritten each run) and printed 
 2026-05-13 09:30:12 [INFO] [分析] NVDA | TV評級: BUY (買:14 賣:4) | MA信號: BUY | 決策: ✅ 允許入市
 2026-05-13 09:30:12 [INFO] [Paper] BUY NVDA 9 股 @ 1023.50
 2026-05-13 09:30:13 [INFO] [Crypto] BTC/USD | MA信號: HOLD | 持倉：0.00 BTC
-2026-05-13 09:30:13 [WARNING] 網路瞬斷，將在 60 秒後重試：RemoteDisconnected(...)
+2026-05-13 09:30:13 [WARNING] 網路瞬斷，將在 15 秒後重試：RemoteDisconnected(...)
 ```
 
 Log colour coding in GUI dashboard:
