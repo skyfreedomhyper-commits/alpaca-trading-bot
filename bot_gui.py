@@ -1,13 +1,19 @@
 """
-Alpaca Trading Bot V3 — GUI Dashboard (tabbed)
+Alpaca Trading Bot V6 — GUI Dashboard (tabbed)
+三功能整合：試跑驗證 / Paper 交易 / 陰陽燭回測
 """
 
 import json
 import os
 import sys
+import webbrowser
 from datetime import datetime, timezone
 
+import pandas as pd
 from dotenv import load_dotenv
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QProcess
 from PyQt6.QtGui import QFont, QColor, QTextCursor
@@ -25,7 +31,7 @@ WATCHLIST_FILE = os.path.join(_DIR, "watchlist.json")
 load_dotenv(os.path.join(_DIR, ".env"))
 _API_KEY      = os.getenv("ALPACA_API_KEY", "")
 _API_SECRET   = os.getenv("ALPACA_API_SECRET", "")
-PAPER_TRADING = True
+PAPER_TRADING = True  # 預設為 Paper Trade
 
 # ── tab indices ──────────────────────────────────────────────────
 TAB_OVERVIEW  = 0
@@ -33,6 +39,7 @@ TAB_ACCOUNT   = 1
 TAB_WATCHLIST = 2
 TAB_POSITIONS = 3
 TAB_ORDERS    = 4
+TAB_BACKTEST  = 5
 
 # ── colours (Catppuccin Mocha) ───────────────────────────────────
 C_BG      = "#1e1e2e"
@@ -165,6 +172,40 @@ class RefreshWorker(QThread):
         self.done.emit(res)
 
 
+# ── Backtest worker ──────────────────────────────────────────────
+class BacktestWorker(QThread):
+    done     = pyqtSignal(dict)   # full results dict
+    progress = pyqtSignal(str)    # one log line per symbol
+
+    def __init__(self, api_key: str, api_secret: str,
+                 watchlist: list, crypto_watchlist: list,
+                 lookback_days: int = 365):
+        super().__init__()
+        self._api_key          = api_key
+        self._api_secret       = api_secret
+        self._watchlist        = list(watchlist)
+        self._crypto_watchlist = list(crypto_watchlist)
+        self._lookback_days    = lookback_days
+
+    def run(self):
+        try:
+            import alpaca_trading_bot as _b
+            results = _b.backtest_for_gui(
+                api_key          = self._api_key,
+                api_secret       = self._api_secret,
+                watchlist        = self._watchlist,
+                crypto_watchlist = self._crypto_watchlist,
+                lookback_days    = self._lookback_days,
+                progress_callback= lambda msg: self.progress.emit(str(msg)),
+            )
+        except Exception as exc:
+            results = {
+                "stocks": [], "crypto": [],
+                "errors": [{"symbol": "SYSTEM", "error": str(exc)}],
+            }
+        self.done.emit(results)
+
+
 # ── Widget helpers ───────────────────────────────────────────────
 def _lbl(text="", bold=False, color=C_TEXT, size=13) -> QLabel:
     w = QLabel(text)
@@ -224,7 +265,7 @@ def _tbl(headers: list[str],
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Alpaca Trading Bot V3 — Dashboard")
+        self.setWindowTitle("Alpaca Trading Bot V6 — Dashboard")
         self.setMinimumSize(1300, 740)
         self.setStyleSheet(_BASE_STYLE)
 
@@ -232,6 +273,10 @@ class MainWindow(QMainWindow):
         self._worker:  RefreshWorker | None = None
         self._prev_prices: dict[str, float] = {}
         self._gui_watchlist: list[str] = load_watchlist()
+        self._backtest_results: dict | None = None
+        self._bt_worker: BacktestWorker | None = None
+        self._current_bt_symbol: str = ""
+        self._bt_all_rows: list[dict] = []
 
         self._build_ui()
         self._refresh_dashboard()
@@ -245,6 +290,9 @@ class MainWindow(QMainWindow):
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
             self._process.terminate()
             self._process.waitForFinished(3000)
+        if self._bt_worker and self._bt_worker.isRunning():
+            self._bt_worker.quit()
+            self._bt_worker.wait(3000)
         event.accept()
 
     # ── shell ────────────────────────────────────────────────────
@@ -281,11 +329,21 @@ class MainWindow(QMainWindow):
             f"background:{C_CARD};border-bottom:1px solid {C_BORDER};")
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(16, 0, 16, 0)
-        lay.addWidget(_lbl("🤖  Alpaca Trading Bot V3 — Dashboard",
+        lay.addWidget(_lbl("🤖  Alpaca Trading Bot V6 — Dashboard",
                            bold=True, size=14, color=C_BLUE))
         lay.addStretch()
 
+        self._btn_trial = QPushButton("🔬  試跑")
+        self._btn_trial.setToolTip("試跑驗證（毋須 API Key）")
+        self._btn_trial.setStyleSheet(
+            f"QPushButton{{background:{C_YELLOW};color:#1e1e2e;border:none;"
+            f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#ffe0a0;}}"
+            f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
+        self._btn_trial.clicked.connect(self._run_trial)
+
         self._btn_start = QPushButton("▶  啟動 Bot")
+        self._btn_start.setToolTip("Paper 交易（需 API Key）")
         self._btn_start.setStyleSheet(
             f"QPushButton{{background:{C_GREEN};color:#1e1e2e;border:none;"
             f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
@@ -293,7 +351,7 @@ class MainWindow(QMainWindow):
             f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
         self._btn_start.clicked.connect(self._start_bot)
 
-        self._btn_stop = QPushButton("⏹  停止 Bot")
+        self._btn_stop = QPushButton("⏹  停止")
         self._btn_stop.setEnabled(False)
         self._btn_stop.setStyleSheet(
             f"QPushButton{{background:{C_RED};color:#1e1e2e;border:none;"
@@ -303,6 +361,7 @@ class MainWindow(QMainWindow):
         self._btn_stop.clicked.connect(self._stop_bot)
 
         self._btn_backtest = QPushButton("📊  回測")
+        self._btn_backtest.setToolTip("陰陽燭圖勝率回測（需 API Key）")
         self._btn_backtest.setStyleSheet(
             f"QPushButton{{background:{C_PURPLE};color:#1e1e2e;border:none;"
             f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
@@ -310,11 +369,22 @@ class MainWindow(QMainWindow):
             f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
         self._btn_backtest.clicked.connect(self._run_backtest)
 
+        # ── Mode Toggle Button ──
+        self._btn_mode = QPushButton("模式：PAPER")
+        self._btn_mode.setToolTip("點擊切換 Paper Trade / 實盤 Trade")
+        self._btn_mode.setFixedWidth(130)
+        self._btn_mode.clicked.connect(self._toggle_mode)
+        self._update_mode_button()
+
+        lay.addWidget(self._btn_trial)
+        lay.addSpacing(8)
         lay.addWidget(self._btn_start)
         lay.addSpacing(8)
         lay.addWidget(self._btn_stop)
         lay.addSpacing(8)
         lay.addWidget(self._btn_backtest)
+        lay.addSpacing(16)
+        lay.addWidget(self._btn_mode)
         return bar
 
     # ── tab container ────────────────────────────────────────────
@@ -325,6 +395,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._build_tab_watchlist(), " 觀察清單 ")
         self._tabs.addTab(self._build_tab_positions(), "  持倉  ")
         self._tabs.addTab(self._build_tab_orders(),    " 交易記錄 ")
+        self._tabs.addTab(self._build_tab_backtest(),  " 📊 回測圖表 ")
         return self._tabs
 
     # ── helpers ──────────────────────────────────────────────────
@@ -562,6 +633,80 @@ class MainWindow(QMainWindow):
         return body
 
     # ═══════════════════════════════════════════════════════════════
+    # TAB 5 — Backtest Chart
+    # ═══════════════════════════════════════════════════════════════
+    def _build_tab_backtest(self) -> QWidget:
+        body = QWidget()
+        outer = QHBoxLayout(body)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Left pane (300 px fixed) ─────────────────────────────
+        left = QWidget()
+        left.setFixedWidth(300)
+        left.setStyleSheet(
+            f"background:{C_CARD};border-right:1px solid {C_BORDER};")
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(10, 12, 10, 12)
+        ll.setSpacing(10)
+
+        ll.addWidget(_lbl("回測標的", bold=True, color=C_BLUE))
+        ll.addWidget(_sep())
+
+        # symbol chips
+        self._bt_chip_area = QWidget()
+        self._bt_chip_layout = QVBoxLayout(self._bt_chip_area)
+        self._bt_chip_layout.setSpacing(4)
+        self._bt_chip_layout.setContentsMargins(0, 0, 0, 0)
+        chip_scroll = self._scrolled(self._bt_chip_area)
+        chip_scroll.setMaximumHeight(200)
+        ll.addWidget(chip_scroll)
+
+        ll.addWidget(_sep())
+        ll.addWidget(_lbl("統計對比（選中標的）", bold=True, color=C_BLUE))
+
+        self._bt_stats_tbl = _tbl(["指標", "純MA", "MA+燭形"], max_h=130)
+        ll.addWidget(self._bt_stats_tbl)
+
+        ll.addWidget(_sep())
+
+        self._btn_tv = QPushButton("在 TradingView 開啟 ↗")
+        self._btn_tv.setToolTip("在系統瀏覽器開啟 TradingView 圖表")
+        self._btn_tv.setStyleSheet(
+            f"QPushButton{{background:{C_BLUE};color:#1e1e2e;border:none;"
+            f"border-radius:5px;padding:6px 10px;font-size:12px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#a8c8ff;}}"
+            f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
+        self._btn_tv.setEnabled(False)
+        self._btn_tv.clicked.connect(self._open_tradingview)
+        ll.addWidget(self._btn_tv)
+
+        ll.addWidget(_lbl("完成回測後選擇標的以顯示 K 線圖",
+                          color=C_SUBTEXT, size=10))
+        ll.addStretch()
+
+        # ── Right pane (chart) ───────────────────────────────────
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(6, 6, 6, 6)
+        rl.setSpacing(0)
+
+        self._bt_fig = Figure(figsize=(9, 5), dpi=100,
+                              facecolor=C_BG, tight_layout=False)
+        self._bt_canvas = FigureCanvasQTAgg(self._bt_fig)
+        self._bt_canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._bt_fig.text(
+            0.5, 0.5, "請先執行回測（📊 回測）",
+            ha="center", va="center", color=C_SUBTEXT, fontsize=14)
+        self._bt_canvas.draw()
+        rl.addWidget(self._bt_canvas, 1)
+
+        outer.addWidget(left)
+        outer.addWidget(right, 1)
+        return body
+
+    # ═══════════════════════════════════════════════════════════════
     # Log panel (right side, always visible)
     # ═══════════════════════════════════════════════════════════════
     def _build_log_panel(self) -> QWidget:
@@ -624,26 +769,114 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════
     # Bot process
     # ═══════════════════════════════════════════════════════════════
-    def _start_bot(self):
-        if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
+    def _get_python(self) -> str:
+        python = os.path.join(os.path.dirname(_DIR), ".venv", "Scripts", "python.exe")
+        return python if os.path.exists(python) else sys.executable
+
+    def _busy(self) -> bool:
+        proc_busy = bool(self._process and
+                         self._process.state() != QProcess.ProcessState.NotRunning)
+        bt_busy   = bool(self._bt_worker and self._bt_worker.isRunning())
+        return proc_busy or bt_busy
+
+    def _set_buttons(self, *, running: bool):
+        self._btn_trial.setEnabled(not running)
+        self._btn_start.setEnabled(not running)
+        self._btn_stop.setEnabled(running)
+        self._btn_backtest.setEnabled(not running)
+
+    def _run_trial(self):
+        if self._busy():
+            QMessageBox.warning(self, "執行中", "請先停止當前任務。")
             return
         self._process = QProcess(self)
-        python = os.path.join(os.path.dirname(_DIR), ".venv", "Scripts", "python.exe")
-        if not os.path.exists(python):
-            python = sys.executable
-        self._process.setProgram(python)
-        self._process.setArguments(
-            ["-X", "utf8", os.path.join(_DIR, "alpaca_trading_bot.py"), "--live"])
+        self._process.setProgram(self._get_python())
+        self._process.setArguments(["-X", "utf8", os.path.join(_DIR, "alpaca_trading_bot.py")])
+        self._process.setWorkingDirectory(_DIR)
+        self._process.readyReadStandardOutput.connect(self._on_stdout)
+        self._process.readyReadStandardError.connect(self._on_stderr)
+        self._process.finished.connect(self._on_trial_done)
+        self._process.start()
+        self._set_buttons(running=True)
+        self._lbl_botstatus.setText(
+            f"Bot 狀態：<span style='color:{C_YELLOW}'>試跑中</span>")
+        self._log_append("[系統] 試跑驗證已啟動（毋須 API Key）…", C_YELLOW)
+
+    def _on_trial_done(self):
+        self._set_buttons(running=False)
+        self._btn_mode.setEnabled(True)
+        self._lbl_botstatus.setText("Bot 狀態：已停止")
+        self._log_append("[系統] 試跑驗證完成 ✓", C_YELLOW)
+
+    def _toggle_mode(self):
+        global PAPER_TRADING
+        if self._busy():
+            return
+        
+        PAPER_TRADING = not PAPER_TRADING
+        self._update_mode_button()
+        
+        mode_str = "模擬 (Paper)" if PAPER_TRADING else "實盤 (Live)"
+        color = C_BLUE if PAPER_TRADING else C_RED
+        self._log_append(f"[系統] 交易模式已切換至：{mode_str}", color)
+        
+        # 立即刷新數據以更新帳戶面板
+        self._refresh_dashboard()
+
+    def _update_mode_button(self):
+        if PAPER_TRADING:
+            text = "模式：PAPER"
+            bg = C_BLUE
+            hover = "#a8c8ff"
+        else:
+            text = "模式：LIVE ⚠️"
+            bg = C_RED
+            hover = "#f5a3b5"
+            
+        self._btn_mode.setText(text)
+        self._btn_mode.setStyleSheet(
+            f"QPushButton{{background:{bg};color:#1e1e2e;border:none;"
+            f"border-radius:5px;padding:6px 10px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{hover};}}"
+            f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
+
+    def _start_bot(self):
+        if self._busy():
+            return
+        
+        args = ["-X", "utf8", os.path.join(_DIR, "alpaca_trading_bot.py"), "--live"]
+        mode_label = "Paper Trading"
+        mode_color = C_GREEN
+        
+        if not PAPER_TRADING:
+            args.append("--real")
+            mode_label = "實盤交易 (LIVE)"
+            mode_color = C_RED
+            
+            reply = QMessageBox.warning(
+                self, "⚠️ 實盤交易確認",
+                "您即將開啟【實盤交易】模式！這將動用您的真實資金。\n\n確定要繼續嗎？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+
+        self._process = QProcess(self)
+        self._process.setProgram(self._get_python())
+        self._process.setArguments(args)
         self._process.setWorkingDirectory(_DIR)
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.readyReadStandardError.connect(self._on_stderr)
         self._process.finished.connect(self._on_bot_done)
         self._process.start()
-        self._btn_start.setEnabled(False)
-        self._btn_stop.setEnabled(True)
+        
+        self._set_buttons(running=True)
+        self._btn_mode.setEnabled(False) # 運行中禁止切換模式
+        
         self._lbl_botstatus.setText(
-            f"Bot 狀態：<span style='color:{C_GREEN}'>執行中</span>")
-        self._log_append("[系統] Bot 已啟動", C_GREEN)
+            f"Bot 狀態：<span style='color:{mode_color}'>執行中 ({mode_label})</span>")
+        self._log_append(f"[系統] {mode_label} Bot 已啟動", mode_color)
 
     def _stop_bot(self):
         if self._process:
@@ -652,35 +885,59 @@ class MainWindow(QMainWindow):
                 self._process.kill()
 
     def _on_bot_done(self):
-        self._btn_start.setEnabled(True)
-        self._btn_stop.setEnabled(False)
+        self._set_buttons(running=False)
+        self._btn_mode.setEnabled(True)
         self._lbl_botstatus.setText("Bot 狀態：已停止")
         self._log_append("[系統] Bot 已停止", C_YELLOW)
 
     def _run_backtest(self):
-        if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
-            QMessageBox.warning(self, "Bot 執行中", "請先停止 Bot 再執行回測。")
+        if self._busy():
+            QMessageBox.warning(self, "執行中", "請先停止當前任務再執行回測。")
             return
-        self._process = QProcess(self)
-        python = os.path.join(os.path.dirname(_DIR), ".venv", "Scripts", "python.exe")
-        if not os.path.exists(python):
-            python = sys.executable
-        self._process.setProgram(python)
-        self._process.setArguments(
-            ["-X", "utf8", os.path.join(_DIR, "alpaca_trading_bot.py"), "--backtest"])
-        self._process.setWorkingDirectory(_DIR)
-        self._process.readyReadStandardOutput.connect(self._on_stdout)
-        self._process.readyReadStandardError.connect(self._on_stderr)
-        self._process.finished.connect(self._on_backtest_done)
-        self._process.start()
-        self._btn_backtest.setEnabled(False)
-        self._btn_start.setEnabled(False)
-        self._log_append("[系統] 回測已啟動，結果將顯示於此記錄面板…", C_PURPLE)
 
-    def _on_backtest_done(self):
-        self._btn_backtest.setEnabled(True)
-        self._btn_start.setEnabled(True)
-        self._log_append("[系統] 回測完成", C_PURPLE)
+        if not _API_KEY or not _API_SECRET:
+            # No API key — text-only fallback via QProcess
+            self._process = QProcess(self)
+            self._process.setProgram(self._get_python())
+            self._process.setArguments(
+                ["-X", "utf8",
+                 os.path.join(_DIR, "alpaca_trading_bot.py"), "--backtest"])
+            self._process.setWorkingDirectory(_DIR)
+            self._process.readyReadStandardOutput.connect(self._on_stdout)
+            self._process.readyReadStandardError.connect(self._on_stderr)
+            self._process.finished.connect(self._on_backtest_done_text)
+            self._process.start()
+            self._set_buttons(running=True)
+            self._lbl_botstatus.setText(
+                f"Bot 狀態：<span style='color:{C_PURPLE}'>回測中（文字模式）</span>")
+            self._log_append("[系統] 未設定 API Key，以文字模式執行回測…", C_PURPLE)
+            return
+
+        # API keys available — use BacktestWorker for chart rendering
+        try:
+            import alpaca_trading_bot as _b
+            cwl = list(_b.CRYPTO_WATCHLIST)
+        except Exception:
+            cwl = []
+
+        self._bt_worker = BacktestWorker(
+            _API_KEY, _API_SECRET,
+            self._gui_watchlist, cwl, lookback_days=365,
+        )
+        self._bt_worker.progress.connect(
+            lambda msg: self._log_append(f"[回測] {msg}", C_PURPLE))
+        self._bt_worker.done.connect(self._on_backtest_results)
+        self._bt_worker.start()
+        self._set_buttons(running=True)
+        self._lbl_botstatus.setText(
+            f"Bot 狀態：<span style='color:{C_PURPLE}'>回測中…</span>")
+        self._log_append(
+            f"[系統] 陰陽燭回測已啟動（{len(self._gui_watchlist)} 隻股票）…", C_PURPLE)
+
+    def _on_backtest_done_text(self):
+        self._set_buttons(running=False)
+        self._lbl_botstatus.setText("Bot 狀態：已停止")
+        self._log_append("[系統] 回測完成 ✓（文字模式）", C_PURPLE)
 
     def _on_stdout(self):
         raw = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
@@ -709,6 +966,213 @@ class MainWindow(QMainWindow):
             html = f"<span style='color:{color}'>{_esc(text)}</span>"
         self._log.append(html)
         self._log.moveCursor(QTextCursor.MoveOperation.End)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Backtest chart helpers
+    # ═══════════════════════════════════════════════════════════════
+    def _draw_candle_chart(self, symbol: str, row: dict):
+        """Render OHLCV candlestick chart with MA + trade markers into self._bt_fig."""
+        self._bt_fig.clear()
+
+        bars_df = row.get("bars_df")
+        candle  = row.get("candle", {})
+
+        if bars_df is None or bars_df.empty:
+            self._bt_fig.text(0.5, 0.5, f"{symbol}\n數據不足，無法顯示圖表",
+                              ha="center", va="center",
+                              color=C_SUBTEXT, fontsize=13)
+            self._bt_canvas.draw()
+            return
+
+        n       = len(bars_df)
+        opens   = bars_df["open"].values
+        highs   = bars_df["high"].values
+        lows    = bars_df["low"].values
+        closes  = bars_df["close"].values
+        volumes = bars_df["volume"].values
+        dates   = list(bars_df.index)
+
+        # date string → bar integer index
+        date_to_idx: dict[str, int] = {str(d)[:10]: i for i, d in enumerate(dates)}
+
+        # ── Subplots (70% price / 30% volume) ─────────────────
+        gs  = self._bt_fig.add_gridspec(
+            2, 1, height_ratios=[0.70, 0.30], hspace=0.04)
+        ax  = self._bt_fig.add_subplot(gs[0])
+        axv = self._bt_fig.add_subplot(gs[1], sharex=ax)
+
+        for a in (ax, axv):
+            a.set_facecolor(C_BG)
+            a.tick_params(colors=C_SUBTEXT, labelsize=8)
+            for spine in a.spines.values():
+                spine.set_edgecolor(C_BORDER)
+            a.grid(color=C_BORDER, alpha=0.25, linewidth=0.5)
+
+        # ── Candles ────────────────────────────────────────────
+        bw = 0.6
+        for i in range(n):
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+            bull   = c >= o
+            body_c = C_GREEN if bull else C_RED
+            ax.plot([i, i], [l, h], color=body_c, linewidth=0.8, zorder=2)
+            rect = Rectangle(
+                (i - bw / 2, min(o, c)), bw, max(abs(c - o), 1e-6),
+                facecolor=body_c, edgecolor=body_c,
+                linewidth=0.4, zorder=3)
+            ax.add_patch(rect)
+            axv.bar(i, volumes[i], width=bw, color=body_c, alpha=0.65, zorder=2)
+
+        # ── MA lines ───────────────────────────────────────────
+        s = pd.Series(closes)
+        ax.plot(range(n), s.rolling(5).mean(),
+                color=C_BLUE,   linewidth=1.0, label="MA5",  zorder=4)
+        ax.plot(range(n), s.rolling(20).mean(),
+                color=C_YELLOW, linewidth=1.0, label="MA20", zorder=4)
+
+        # ── Trade markers (candle strategy) ────────────────────
+        for trade in candle.get("trades", []):
+            ei = date_to_idx.get(str(trade.get("entry_date", ""))[:10])
+            xi = date_to_idx.get(str(trade.get("exit_date",  ""))[:10])
+            win = trade.get("pnl_pct", 0) > 0
+
+            if ei is not None:
+                ax.plot(ei, closes[ei] * 0.993,
+                        marker="^", color=C_GREEN,
+                        markersize=8, zorder=6, linestyle="None")
+            if xi is not None:
+                ax.plot(xi, closes[xi] * 1.007,
+                        marker="v",
+                        color=C_GREEN if win else C_RED,
+                        markersize=8, zorder=6, linestyle="None")
+            if ei is not None and xi is not None and xi > ei:
+                ax.axvspan(ei, xi, alpha=0.07,
+                           color=C_GREEN if win else C_RED, zorder=1)
+
+        # ── X-axis labels ──────────────────────────────────────
+        step   = max(1, n // 10)
+        ticks  = list(range(0, n, step))
+        labels = [str(dates[i])[:10] for i in ticks]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([])
+        axv.set_xticks(ticks)
+        axv.set_xticklabels(labels, rotation=28, ha="right", fontsize=7,
+                            color=C_SUBTEXT)
+
+        # ── Axis ranges / labels ───────────────────────────────
+        ax.set_xlim(-1, n)
+        pad = (highs.max() - lows.min()) * 0.05 or highs.max() * 0.01
+        ax.set_ylim(lows.min() - pad, highs.max() + pad)
+        tv_rating = row.get("tv", {}).get("tv_rating", "N/A")
+        ax.set_title(
+            f"{symbol}  ·  {n} 個交易日  ·  TV: {tv_rating}",
+            color=C_TEXT, fontsize=11, pad=5)
+        ax.set_ylabel("價格 (USD)", color=C_SUBTEXT, fontsize=8)
+        axv.set_ylabel("成交量", color=C_SUBTEXT, fontsize=8)
+        ax.tick_params(axis="y", colors=C_SUBTEXT)
+        axv.tick_params(axis="y", colors=C_SUBTEXT)
+
+        ax.legend(fontsize=8, facecolor=C_CARD,
+                  edgecolor=C_BORDER, labelcolor=C_TEXT, loc="upper left")
+
+        self._bt_fig.subplots_adjust(
+            left=0.07, right=0.97, top=0.93, bottom=0.12)
+        self._bt_canvas.draw()
+
+    def _populate_bt_chips(self, results: dict):
+        """Rebuild symbol chip buttons after backtest completes."""
+        while self._bt_chip_layout.count():
+            item = self._bt_chip_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        all_rows = results.get("stocks", []) + results.get("crypto", [])
+        self._bt_all_rows = all_rows
+
+        if not all_rows:
+            self._bt_chip_layout.addWidget(_lbl("無回測結果", color=C_SUBTEXT))
+            return
+
+        for row in all_rows:
+            sym = row["symbol"]
+            btn = QPushButton(sym)
+            btn.setCheckable(True)
+            btn.setStyleSheet(
+                f"QPushButton{{background:{C_CARD};color:{C_TEXT};"
+                f"border:1px solid {C_BORDER};border-radius:4px;"
+                f"padding:5px 8px;font-size:12px;text-align:left;}}"
+                f"QPushButton:checked{{background:{C_PURPLE};color:#1e1e2e;"
+                f"border-color:{C_PURPLE};}}"
+                f"QPushButton:hover:!checked{{background:{C_BORDER};}}")
+            btn.clicked.connect(lambda _, r=row: self._select_bt_symbol(r))
+            self._bt_chip_layout.addWidget(btn)
+
+        self._select_bt_symbol(all_rows[0])
+        first = self._bt_chip_layout.itemAt(0).widget()
+        if first:
+            first.setChecked(True)
+
+    def _select_bt_symbol(self, row: dict):
+        """Load stats + chart for the selected symbol row."""
+        symbol = row["symbol"]
+        self._current_bt_symbol = symbol
+
+        # update chip checked state
+        for i in range(self._bt_chip_layout.count()):
+            btn = self._bt_chip_layout.itemAt(i).widget()
+            if isinstance(btn, QPushButton):
+                btn.setChecked(btn.text() == symbol)
+
+        # stats comparison table (3 rows)
+        ma     = row.get("ma",     {})
+        candle = row.get("candle", {})
+        ma_wr  = ma.get("win_rate", 0)
+        ca_wr  = candle.get("win_rate", 0)
+        ma_pnl = ma.get("avg_pnl", 0)
+        ca_pnl = candle.get("avg_pnl", 0)
+
+        stats = [
+            ("交易筆數", str(ma.get("total", 0)), str(candle.get("total", 0)),
+             C_TEXT),
+            ("勝率",
+             f"{ma_wr*100:.1f}%",
+             f"{ca_wr*100:.1f}%",
+             C_GREEN if ca_wr >= ma_wr else C_RED),
+            ("平均損益",
+             f"{ma_pnl:+.2f}%",
+             f"{ca_pnl:+.2f}%",
+             C_GREEN if ca_pnl >= ma_pnl else C_RED),
+        ]
+        self._bt_stats_tbl.setRowCount(len(stats))
+        for r, (label, ma_v, ca_v, ca_col) in enumerate(stats):
+            self._bt_stats_tbl.setItem(r, 0, _cell(label, C_SUBTEXT))
+            self._bt_stats_tbl.setItem(r, 1, _cell(ma_v))
+            self._bt_stats_tbl.setItem(r, 2, _cell(ca_v, ca_col))
+        self._bt_stats_tbl.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+
+        self._btn_tv.setEnabled(True)
+        self._draw_candle_chart(symbol, row)
+
+    def _open_tradingview(self):
+        sym = self._current_bt_symbol.replace("/", "")
+        webbrowser.open(f"https://www.tradingview.com/chart/?symbol={sym}")
+
+    def _on_backtest_results(self, results: dict):
+        self._backtest_results = results
+        self._set_buttons(running=False)
+        self._lbl_botstatus.setText("Bot 狀態：已停止")
+
+        total  = len(results.get("stocks", [])) + len(results.get("crypto", []))
+        errors = results.get("errors", [])
+        self._log_append(
+            f"[系統] 回測完成 ✓  成功 {total} 個標的，錯誤 {len(errors)} 個",
+            C_PURPLE)
+        for e in errors:
+            self._log_append(f"[回測錯誤] {e['symbol']}: {e['error']}", C_RED)
+
+        if total > 0:
+            self._populate_bt_chips(results)
+            self._tabs.setCurrentIndex(TAB_BACKTEST)
 
     # ═══════════════════════════════════════════════════════════════
     # Refresh & update

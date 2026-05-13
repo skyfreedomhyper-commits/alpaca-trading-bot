@@ -1,14 +1,13 @@
 """
-Alpaca 自動交易機器人 — V6
+Alpaca 自動交易機器人 — V5
 雙均線策略（5日線 / 20日線）
 + TradingView 技術評級雙重確認
-+ 陰陽燭形態三重確認（參考 CandleSticker.com）
 + 2% 滾動止損（Trailing Stop Loss）
 + 開市前自動選股（5年回測評分）
 + 24/7 加密貨幣策略（BTC/ETH/SOL/AVAX/LINK）
 + 持倉股持續監察直至平倉
 + 瞬斷錯誤分類優化
-+ 投資組合回測（--backtest）：按圖表陰陽燭形態計算勝率
++ 投資組合回測（--backtest）：雙重勝率報告 + TradingView 即時評級
 
 環境變數設定（建議儲存於 .env 檔案）：
   ALPACA_API_KEY    = 您的 API Key ID
@@ -19,8 +18,7 @@ Alpaca 自動交易機器人 — V6
 
 使用說明：
   python -X utf8 alpaca_trading_bot.py                    # 試跑驗證
-  python -X utf8 alpaca_trading_bot.py --live             # 連線 Alpaca Paper (預設)
-  python -X utf8 alpaca_trading_bot.py --live --real      # 連線 Alpaca 實盤 (⚠️ 真實資金)
+  python -X utf8 alpaca_trading_bot.py --live             # 連線 Alpaca 實盤/Paper
   python -X utf8 alpaca_trading_bot.py --backtest         # 投資組合回測（預設 365 天）
   python -X utf8 alpaca_trading_bot.py --backtest --days 180  # 自訂回測天數
 """
@@ -54,7 +52,7 @@ from alpaca.data.enums import DataFeed
 from tradingview_ta import TA_Handler, Interval
 
 # ============================================================
-# ⚠️  模式切換（可透過 CLI 參數 --real 切換）
+# ⚠️  模式切換
 #   True  = Alpaca Paper Trading（模擬，安全預設值）
 #   False = Alpaca 真實帳戶（實盤，有真實資金風險！）
 # ============================================================
@@ -109,8 +107,6 @@ SCREEN_LOOKBACK_YEARS = 5   # 回溯年數
 
 # GUI 手動觀察清單共享檔（bot_gui.py 寫入，bot 每次輪詢讀取）
 WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
-# 滾動止損峰值持久化檔案
-PEAKS_FILE = os.path.join(os.path.dirname(__file__), "peaks.json")
 
 # ============================================================
 # 加密貨幣設定（24/7 運行，不受股票市場開收市影響）
@@ -139,27 +135,8 @@ log = logging.getLogger(__name__)
 
 # 試跑模式用的記憶體持倉
 _paper_positions: dict[str, dict] = {}
-
-def load_peaks() -> dict[str, float]:
-    if os.path.exists(PEAKS_FILE):
-        try:
-            import json as _json
-            with open(PEAKS_FILE, encoding="utf-8") as f:
-                return _json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def save_peaks(peaks: dict[str, float]):
-    try:
-        import json as _json
-        with open(PEAKS_FILE, "w", encoding="utf-8") as f:
-            _json.dump(peaks, f, indent=4)
-    except Exception as e:
-        log.error("儲存峰值檔案失敗: %s", e)
-
-# 各持倉的歷史最高價（用於滾動止損，從檔案載入）
-_position_peaks: dict[str, float] = load_peaks()
+# 各持倉的歷史最高價（用於滾動止損）
+_position_peaks: dict[str, float] = {}
 # 本次 session 內已無法取得數據的符號（避免每輪詢重複警告）
 _data_failed_symbols: set[str] = set()
 
@@ -219,14 +196,14 @@ def analyse_stock(symbol: str) -> dict:
 
 
 # ----------------------------------------------------------
-# 歷史行情（OHLCV）
+# 歷史行情
 # ----------------------------------------------------------
-def get_historical_bars_df(
+def get_historical_closes(
     data_client: StockHistoricalDataClient,
     symbol: str,
     days: int,
-) -> pd.DataFrame:
-    """抓取最近 N 個交易日完整 OHLCV 資料（供均線計算及陰陽燭形態識別使用）"""
+) -> pd.Series:
+    """抓取最近 N 個交易日的收盤價"""
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=days + 30)
     req   = StockBarsRequest(
@@ -239,20 +216,10 @@ def get_historical_bars_df(
     bars = data_client.get_stock_bars(req)
     df   = bars.df
     if df.empty:
-        return pd.DataFrame()
+        return pd.Series(dtype=float)
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level="symbol")
-    return df[["open", "high", "low", "close", "volume"]].sort_index().tail(days)
-
-
-def get_historical_closes(
-    data_client: StockHistoricalDataClient,
-    symbol: str,
-    days: int,
-) -> pd.Series:
-    """抓取最近 N 個交易日的收盤價（向後相容保留）"""
-    df = get_historical_bars_df(data_client, symbol, days)
-    return df["close"] if not df.empty else pd.Series(dtype=float)
+    return df["close"].sort_index().tail(days)
 
 
 # ----------------------------------------------------------
@@ -337,183 +304,17 @@ def calc_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
 
 
 # ----------------------------------------------------------
-# 陰陽燭形態識別（參考 CandleSticker.com 常見形態）
-# 涵蓋：槌子線、倒槌線、蜻蜓十字、流星線、上吊線、
-#       牛市吞沒、熊市吞沒、穿刺線、烏雲蓋頂、牛市孕線、熊市孕線、
-#       晨星、夜星、三白兵、三黑鴉
-# ----------------------------------------------------------
-
-CANDLE_LOOKBACK = 3   # 入場前 N 根 K 棒內有看漲/看跌形態即視為確認
-
-
-def _candle_body(o: float, c: float) -> float:
-    return abs(c - o)
-
-
-def _upper_wick(o: float, c: float, h: float) -> float:
-    return h - max(o, c)
-
-
-def _lower_wick(o: float, c: float, lo: float) -> float:
-    return min(o, c) - lo
-
-
-def detect_candle_patterns(df: pd.DataFrame, i: int) -> dict:
-    """
-    分析 df 第 i 根K棒（及前兩根）的陰陽燭形態。
-    df 必須含 open / high / low / close 欄位。
-    回傳 {"bullish": bool, "bearish": bool, "patterns": list[str]}
-    """
-    if i < 0 or i >= len(df):
-        return {"bullish": False, "bearish": False, "patterns": []}
-
-    o0 = float(df["open"].iloc[i])
-    h0 = float(df["high"].iloc[i])
-    l0 = float(df["low"].iloc[i])
-    c0 = float(df["close"].iloc[i])
-
-    body0  = _candle_body(o0, c0)
-    range0 = (h0 - l0) or 1e-9
-    up0    = _upper_wick(o0, c0, h0)
-    lo0    = _lower_wick(o0, c0, l0)
-    bull0  = c0 > o0
-    bear0  = c0 < o0
-
-    patterns: list[str] = []
-    bullish = bearish = False
-
-    # ── 單根形態 ────────────────────────────────────────────
-    is_doji = body0 / range0 < 0.05
-
-    # 槌子線 Hammer：牛，下影 ≥ 2×實體，上影 ≤ 20% 總幅
-    if bull0 and body0 > 0 and lo0 >= 2 * body0 and up0 <= 0.2 * range0:
-        patterns.append("槌子線"); bullish = True
-
-    # 倒槌線 Inverted Hammer：上影 ≥ 2×實體，下影 ≤ 20%
-    if bull0 and body0 > 0 and up0 >= 2 * body0 and lo0 <= 0.2 * range0:
-        patterns.append("倒槌線"); bullish = True
-
-    # 蜻蜓十字 Dragonfly Doji
-    if is_doji and lo0 > up0 * 2:
-        patterns.append("蜻蜓十字"); bullish = True
-
-    # 流星線 Shooting Star：熊，上影 ≥ 2×實體，下影 ≤ 20%
-    if bear0 and body0 > 0 and up0 >= 2 * body0 and lo0 <= 0.2 * range0:
-        patterns.append("流星線"); bearish = True
-
-    # 上吊線 Hanging Man：熊，下影 ≥ 2×實體，上影 ≤ 20%
-    if bear0 and body0 > 0 and lo0 >= 2 * body0 and up0 <= 0.2 * range0:
-        patterns.append("上吊線"); bearish = True
-
-    # ── 兩根形態 ────────────────────────────────────────────
-    if i >= 1:
-        o1 = float(df["open"].iloc[i - 1])
-        h1 = float(df["high"].iloc[i - 1])
-        l1 = float(df["low"].iloc[i - 1])
-        c1 = float(df["close"].iloc[i - 1])
-        body1 = _candle_body(o1, c1)
-        bull1 = c1 > o1
-        bear1 = c1 < o1
-
-        # 牛市吞沒 Bullish Engulfing
-        if bear1 and bull0 and o0 <= c1 and c0 >= o1:
-            patterns.append("牛市吞沒"); bullish = True
-
-        # 熊市吞沒 Bearish Engulfing
-        if bull1 and bear0 and o0 >= c1 and c0 <= o1:
-            patterns.append("熊市吞沒"); bearish = True
-
-        # 穿刺線 Piercing Line
-        if (bear1 and bull0 and body1 > 0
-                and o0 < l1 and c0 > (o1 + c1) / 2 and c0 < o1):
-            patterns.append("穿刺線"); bullish = True
-
-        # 烏雲蓋頂 Dark Cloud Cover
-        if (bull1 and bear0 and body1 > 0
-                and o0 > h1 and c0 < (o1 + c1) / 2 and c0 > o1):
-            patterns.append("烏雲蓋頂"); bearish = True
-
-        # 牛市孕線 Bullish Harami
-        if (bear1 and bull0 and body1 > 0
-                and o0 > c1 and c0 < o1 and body0 < body1 * 0.6):
-            patterns.append("牛市孕線"); bullish = True
-
-        # 熊市孕線 Bearish Harami
-        if (bull1 and bear0 and body1 > 0
-                and o0 < c1 and c0 > o1 and body0 < body1 * 0.6):
-            patterns.append("熊市孕線"); bearish = True
-
-    # ── 三根形態 ────────────────────────────────────────────
-    if i >= 2:
-        o2 = float(df["open"].iloc[i - 2])
-        c2 = float(df["close"].iloc[i - 2])
-        o1 = float(df["open"].iloc[i - 1])
-        c1 = float(df["close"].iloc[i - 1])
-        body2 = _candle_body(o2, c2)
-        body1 = _candle_body(o1, c1)
-        bull2 = c2 > o2
-        bear2 = c2 < o2
-        bull1 = c1 > o1
-        bear1 = c1 < o1
-
-        # 晨星 Morning Star
-        if (bear2 and body2 > 0.01 * abs(c2)
-                and body1 < body2 * 0.4
-                and bull0 and c0 > (o2 + c2) / 2):
-            patterns.append("晨星"); bullish = True
-
-        # 夜星 Evening Star
-        if (bull2 and body2 > 0.01 * abs(c2)
-                and body1 < body2 * 0.4
-                and bear0 and c0 < (o2 + c2) / 2):
-            patterns.append("夜星"); bearish = True
-
-        # 三白兵 Three White Soldiers
-        if (bull2 and bull1 and bull0
-                and body1 > body2 * 0.7 and body0 > body1 * 0.7):
-            patterns.append("三白兵"); bullish = True
-
-        # 三黑鴉 Three Black Crows
-        if (bear2 and bear1 and bear0
-                and body1 > body2 * 0.7 and body0 > body1 * 0.7):
-            patterns.append("三黑鴉"); bearish = True
-
-    return {"bullish": bullish, "bearish": bearish, "patterns": patterns}
-
-
-def has_recent_candle_signal(
-    df: pd.DataFrame, i: int, signal_type: str, lookback: int = CANDLE_LOOKBACK
-) -> tuple[bool, list[str]]:
-    """
-    在第 i 根K棒往前 lookback 根範圍內，是否出現指定方向的陰陽燭形態。
-    signal_type: "bullish" 或 "bearish"
-    回傳 (found: bool, patterns: list[str])（去重、保序）
-    """
-    all_patterns: list[str] = []
-    for j in range(max(0, i - lookback + 1), i + 1):
-        result = detect_candle_patterns(df, j)
-        if result[signal_type]:
-            for p in result["patterns"]:
-                if p not in all_patterns:
-                    all_patterns.append(p)
-    return bool(all_patterns), all_patterns
-
-
-# ----------------------------------------------------------
 # 單一標的回測引擎
 # ----------------------------------------------------------
 def _backtest_symbol(
     closes: pd.Series,
     symbol: str,
-    bars_df: pd.DataFrame | None = None,
-    use_candle_filter: bool = False,
+    use_rsi_filter: bool = False,
     trailing_stop_pct: float = TRAILING_STOP_PCT,
 ) -> dict:
     """
     模擬 5/20 均線金叉/死叉策略（含滾動止損）。
-    use_candle_filter=True 時，金叉進場前須確認過去 CANDLE_LOOKBACK 根K棒內
-    出現看漲陰陽燭形態（晨星、牛市吞沒、槌子線等），作為圖表確認信號。
-    bars_df 需含 open/high/low/close 欄位，索引需與 closes 對齊。
+    use_rsi_filter=True 時，金叉進場前須確認 RSI-14 > 50（TV BUY 評級的歷史代理指標）。
 
     回傳 dict：
       symbol, trades[], total, wins, losses, win_rate,
@@ -521,15 +322,14 @@ def _backtest_symbol(
     """
     ma_short = closes.rolling(SHORT_MA).mean()
     ma_long  = closes.rolling(LONG_MA).mean()
+    rsi      = calc_rsi(closes) if use_rsi_filter else None
 
     trades: list[dict] = []
     in_trade    = False
     entry_price = 0.0
     entry_date  = None
-    entry_idx   = 0       # 記錄進場 bar 索引，用於計算持倉天數
     peak        = 0.0
-    # 統一轉為 date 字串，避免 Timestamp 時區比較錯誤
-    dates = [str(d)[:10] for d in closes.index.tolist()]
+    dates       = closes.index.tolist()
 
     for i in range(1, len(closes)):
         ps, cs = ma_short.iloc[i - 1], ma_short.iloc[i]
@@ -541,14 +341,11 @@ def _backtest_symbol(
 
         if not in_trade:
             if ps <= pl and cs > cl:   # 金叉進場
-                if use_candle_filter and bars_df is not None and not bars_df.empty:
-                    found, _ = has_recent_candle_signal(bars_df, i, "bullish")
-                    if not found:
-                        continue       # 無看漲燭形確認，跳過本次進場
+                if use_rsi_filter and (pd.isna(rsi.iloc[i]) or rsi.iloc[i] <= 50):
+                    continue           # RSI 未達 50，跳過本次進場
                 in_trade    = True
                 entry_price = price
                 entry_date  = dates[i]
-                entry_idx   = i
                 peak        = price
         else:
             if price > peak:
@@ -563,7 +360,7 @@ def _backtest_symbol(
                     "entry_price": entry_price,
                     "exit_price":  price,
                     "pnl_pct":     (price - entry_price) / entry_price * 100,
-                    "hold_days":   i - entry_idx,
+                    "hold_days":   int((dates[i] - entry_date).days),
                     "exit_type":   "STOP",
                 })
                 in_trade = False
@@ -577,7 +374,7 @@ def _backtest_symbol(
                     "entry_price": entry_price,
                     "exit_price":  price,
                     "pnl_pct":     (price - entry_price) / entry_price * 100,
-                    "hold_days":   i - entry_idx,
+                    "hold_days":   int((dates[i] - entry_date).days),
                     "exit_type":   "CROSS",
                 })
                 in_trade = False
@@ -770,9 +567,7 @@ def place_order(
 
     # 賣出時清除峰值記錄
     if side == OrderSide.SELL:
-        if symbol in _position_peaks:
-            _position_peaks.pop(symbol, None)
-            save_peaks(_position_peaks)
+        _position_peaks.pop(symbol, None)
 
     if trial:
         pos = _paper_positions.get(symbol, {"quantity": 0, "avg_cost": 0.0})
@@ -813,9 +608,7 @@ def update_trailing_stop(
     """
     pos = get_current_position(trading_client, symbol, trial=trial)
     if pos["quantity"] <= 0:
-        if symbol in _position_peaks:
-            _position_peaks.pop(symbol, None)
-            save_peaks(_position_peaks)
+        _position_peaks.pop(symbol, None)
         return
 
     if trial:
@@ -826,16 +619,10 @@ def update_trailing_stop(
         return
 
     # 更新峰值
-    if symbol not in _position_peaks:
-        _position_peaks[symbol] = current_price
-        save_peaks(_position_peaks)
-        log.info("%s 滾動止損監測已啟動，初始峰值：$%.4f", symbol, current_price)
-
-    peak = _position_peaks[symbol]
+    peak = _position_peaks.get(symbol, current_price)
     if current_price > peak:
         peak = current_price
         _position_peaks[symbol] = peak
-        save_peaks(_position_peaks)
         log.info("%s 峰值更新：$%.4f", symbol, peak)
 
     # 計算回撤
@@ -906,14 +693,13 @@ def run_strategy(trading_client: TradingClient, data_client: StockHistoricalData
             # 1. 滾動止損檢查（優先執行）
             update_trailing_stop(trading_client, data_client, symbol)
 
-            # 2. 抓取完整 OHLCV + 均線信號
-            bars_df = get_historical_bars_df(data_client, symbol, LONG_MA + BUY_WINDOW + 5)
-            if bars_df.empty:
+            # 2. 抓歷史收盤價 + 均線信號
+            closes = get_historical_closes(data_client, symbol, LONG_MA + BUY_WINDOW + 5)
+            if closes.empty:
                 if symbol not in _data_failed_symbols:
                     log.warning("%s 無法取得歷史行情（IEX 未覆蓋），本 session 後續靜默跳過", symbol)
                     _data_failed_symbols.add(symbol)
                 continue
-            closes = bars_df["close"]
 
             ma_signal = compute_signal(closes)
             pos       = get_current_position(trading_client, symbol)
@@ -926,38 +712,23 @@ def run_strategy(trading_client: TradingClient, data_client: StockHistoricalData
                     tv = analyse_stock(symbol)
 
                     if tv["tv_rating"] == "UNKNOWN":
-                        tv_ok    = True
-                        tv_label = "⚠️ TV不可用"
+                        allow_entry = True
+                        decision    = "⚠️ TV不可用，僅憑MA信號入市"
                     else:
-                        tv_ok    = tv["bullish"]
-                        tv_label = tv["tv_rating"]
-
-                    # 陰陽燭圖形態三重確認
-                    candle_found, candle_patterns = has_recent_candle_signal(
-                        bars_df, len(bars_df) - 1, "bullish"
-                    )
-                    candle_str = "、".join(candle_patterns) if candle_found else "無看漲形態"
-
-                    allow_entry = tv_ok and candle_found
-                    if not tv_ok:
-                        decision = f"❌ TV評級不足（{tv_label}），跳過"
-                    elif not candle_found:
-                        decision = "❌ 無看漲陰陽燭確認，跳過"
-                    else:
-                        decision = f"✅ 允許入市（燭形：{candle_str}）"
+                        allow_entry = tv["bullish"]
+                        decision    = "✅ 允許入市" if allow_entry else "❌ TV評級不足，跳過"
 
                     log.info(
-                        "[分析] %s | TV評級: %s (買:%d 賣:%d) | MA信號: %s | 燭形: %s | 決策: %s",
+                        "[分析] %s | TV評級: %s (買:%d 賣:%d) | MA信號: %s | 決策: %s",
                         symbol, tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"],
-                        ma_signal, candle_str, decision,
+                        ma_signal, decision,
                     )
                     if allow_entry:
                         current_price = get_latest_price(data_client, symbol) or closes.iloc[-1]
                         qty    = max(1, int(CAPITAL_PER_TRADE / current_price))
-                        reason = f"TV+MA+燭形三重確認（{candle_str}）"
+                        reason = "TV+MA雙確認買入" if tv["tv_rating"] != "UNKNOWN" else "MA金叉買入（TV不可用）"
                         place_order(trading_client, symbol, OrderSide.BUY, qty, current_price, reason)
                         _position_peaks[symbol] = current_price
-                        save_peaks(_position_peaks)
 
             # 4. 賣出邏輯：MA 死叉（持倉監察狀態同樣執行）
             elif ma_signal == "SELL" and pos["quantity"] > 0:
@@ -1017,12 +788,12 @@ def analyse_crypto(symbol: str) -> dict:
     return {"tv_rating": "UNKNOWN", "tv_buy_count": 0, "tv_sell_count": 0, "bullish": False, "exchange": "N/A"}
 
 
-def get_crypto_historical_bars_df(
+def get_crypto_historical_closes(
     crypto_client: CryptoHistoricalDataClient,
     symbol: str,
     days: int,
-) -> pd.DataFrame:
-    """抓取加密貨幣最近 N 天完整 OHLCV 資料（供陰陽燭形態識別使用）"""
+) -> pd.Series:
+    """抓取加密貨幣最近 N 天日線收盤價（24/7，無需 DataFeed）"""
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=days + 10)
     req   = CryptoBarsRequest(
@@ -1034,20 +805,10 @@ def get_crypto_historical_bars_df(
     bars = crypto_client.get_crypto_bars(req)
     df   = bars.df
     if df.empty:
-        return pd.DataFrame()
+        return pd.Series(dtype=float)
     if isinstance(df.index, pd.MultiIndex):
         df = df.xs(symbol, level="symbol")
-    return df[["open", "high", "low", "close", "volume"]].sort_index().tail(days)
-
-
-def get_crypto_historical_closes(
-    crypto_client: CryptoHistoricalDataClient,
-    symbol: str,
-    days: int,
-) -> pd.Series:
-    """抓取加密貨幣最近 N 天日線收盤價（向後相容保留）"""
-    df = get_crypto_historical_bars_df(crypto_client, symbol, days)
-    return df["close"] if not df.empty else pd.Series(dtype=float)
+    return df["close"].sort_index().tail(days)
 
 
 def get_crypto_latest_price(
@@ -1097,9 +858,7 @@ def place_crypto_order(
     )
 
     if side == OrderSide.SELL:
-        if symbol in _position_peaks:
-            _position_peaks.pop(symbol, None)
-            save_peaks(_position_peaks)
+        _position_peaks.pop(symbol, None)
 
     order_req = MarketOrderRequest(
         symbol=symbol,
@@ -1120,25 +879,17 @@ def update_crypto_trailing_stop(
     pos = get_crypto_position(trading_client, symbol)
     if pos["quantity"] <= 1e-8:
         _position_peaks.pop(symbol, None)
-        save_peaks(_position_peaks)
         return
 
     current_price = get_crypto_latest_price(crypto_client, symbol)
     if current_price is None:
         return
 
-    # 更新峰值
-    if symbol not in _position_peaks:
-        _position_peaks[symbol] = current_price
-        save_peaks(_position_peaks)
-        log.info("[加密] %s 滾動止損監測已啟動，初始峰值：$%.4f", symbol, current_price)
-
-    peak = _position_peaks[symbol]
+    peak = _position_peaks.get(symbol, current_price)
     if current_price > peak:
         peak = current_price
         _position_peaks[symbol] = peak
-        save_peaks(_position_peaks)
-        log.info("[加密] %s 峰值更新：$%.4f", symbol, peak)
+        log.info("%s 加密峰值更新：$%.4f", symbol, peak)
 
     drawdown = (peak - current_price) / peak
     log.info(
@@ -1235,7 +986,6 @@ def run_crypto_strategy(
                             buy_qty, current_price, reason,
                         )
                         _position_peaks[symbol] = current_price
-                        save_peaks(_position_peaks)
 
             # 4. 賣出：MA 死叉（持倉監察狀態同樣執行）
             elif ma_signal == "SELL" and pos["quantity"] > 1e-8:
@@ -1293,20 +1043,20 @@ def _print_backtest_table(label: str, results: list[dict]) -> None:
         return
     hdr = (
         f"\n  {'Symbol':<10} | {'MA筆數':>6} | {'MA勝率':>7} | {'MA均損益':>8}"
-        f" | {'燭形筆數':>8} | {'燭形勝率':>8} | {'燭形均損益':>10} | {'止損':>5} | TV即時評級"
+        f" | {'RSI筆數':>7} | {'RSI勝率':>8} | {'RSI均損益':>9} | {'止損':>5} | TV即時評級"
     )
-    sep = "  " + "-" * 95
+    sep = "  " + "-" * 90
     log.info("%s  (%d 個標的)", label, len(results))
     log.info(hdr)
     log.info(sep)
     for row in results:
-        ma, candle, tv = row["ma"], row["candle"], row["tv"]
+        ma, rsi, tv = row["ma"], row["rsi"], row["tv"]
         stop_str = f"{ma['stop_exits']}/{ma['total']}" if ma["total"] else "0/0"
         log.info(
-            "  %-10s | %6d  | %6.1f%%  | %+7.2f%% | %8d  | %7.1f%%   | %+9.2f%% | %5s | %s",
+            "  %-10s | %6d  | %6.1f%%  | %+7.2f%% | %7d  | %7.1f%%  | %+8.2f%% | %5s | %s",
             row["symbol"],
-            ma["total"],     ma["win_rate"]     * 100, ma["avg_pnl"],
-            candle["total"], candle["win_rate"] * 100, candle["avg_pnl"],
+            ma["total"],   ma["win_rate"]  * 100, ma["avg_pnl"],
+            rsi["total"],  rsi["win_rate"] * 100, rsi["avg_pnl"],
             stop_str, tv["tv_rating"],
         )
     log.info(sep)
@@ -1322,33 +1072,33 @@ def _print_portfolio_aggregate(results: list[dict]) -> None:
         log.info(div)
         return
 
-    ma_total     = sum(r["ma"]["total"]         for r in results)
-    candle_total = sum(r["candle"]["total"]      for r in results)
-    ma_wins      = sum(r["ma"]["wins"]           for r in results)
-    candle_wins  = sum(r["candle"]["wins"]       for r in results)
-    ma_stops     = sum(r["ma"]["stop_exits"]     for r in results)
-    candle_stops = sum(r["candle"]["stop_exits"] for r in results)
-    ma_pnls      = [t["pnl_pct"] for r in results for t in r["ma"]["trades"]]
-    candle_pnls  = [t["pnl_pct"] for r in results for t in r["candle"]["trades"]]
+    ma_total  = sum(r["ma"]["total"]  for r in results)
+    rsi_total = sum(r["rsi"]["total"] for r in results)
+    ma_wins   = sum(r["ma"]["wins"]   for r in results)
+    rsi_wins  = sum(r["rsi"]["wins"]  for r in results)
+    ma_stops  = sum(r["ma"]["stop_exits"]  for r in results)
+    rsi_stops = sum(r["rsi"]["stop_exits"] for r in results)
+    ma_pnls   = [t["pnl_pct"] for r in results for t in r["ma"]["trades"]]
+    rsi_pnls  = [t["pnl_pct"] for r in results for t in r["rsi"]["trades"]]
 
-    ma_wr     = ma_wins     / ma_total     if ma_total     else 0.0
-    candle_wr = candle_wins / candle_total if candle_total else 0.0
-    ma_avg     = float(np.mean(ma_pnls))     if ma_pnls     else 0.0
-    candle_avg = float(np.mean(candle_pnls)) if candle_pnls else 0.0
+    ma_wr  = ma_wins  / ma_total  if ma_total  else 0.0
+    rsi_wr = rsi_wins / rsi_total if rsi_total else 0.0
+    ma_avg  = float(np.mean(ma_pnls))  if ma_pnls  else 0.0
+    rsi_avg = float(np.mean(rsi_pnls)) if rsi_pnls else 0.0
 
-    log.info("%-24s | %-18s | %-18s", "", "MA-Only", "MA + 陰陽燭確認")
-    log.info("%-24s | %-18s | %-18s", "-" * 24, "-" * 18, "-" * 18)
-    log.info("%-24s | %-18s | %-18s", "Completed trades",
-             str(ma_total), str(candle_total))
-    log.info("%-24s | %-18s | %-18s", "Win rate",
-             f"{ma_wr * 100:.1f}%", f"{candle_wr * 100:.1f}%")
-    log.info("%-24s | %-18s | %-18s", "Avg trade P&L",
-             f"{ma_avg:+.2f}%", f"{candle_avg:+.2f}%")
-    log.info("%-24s | %-18s | %-18s", "Stop-loss exits",
-             f"{ma_stops}/{ma_total}", f"{candle_stops}/{candle_total}")
+    log.info("%-24s | %-14s | %-14s", "", "MA-Only", "MA + RSI>50")
+    log.info("%-24s | %-14s | %-14s", "-" * 24, "-" * 14, "-" * 14)
+    log.info("%-24s | %-14s | %-14s", "Completed trades",
+             str(ma_total), str(rsi_total))
+    log.info("%-24s | %-14s | %-14s", "Win rate",
+             f"{ma_wr * 100:.1f}%", f"{rsi_wr * 100:.1f}%")
+    log.info("%-24s | %-14s | %-14s", "Avg trade P&L",
+             f"{ma_avg:+.2f}%", f"{rsi_avg:+.2f}%")
+    log.info("%-24s | %-14s | %-14s", "Stop-loss exits",
+             f"{ma_stops}/{ma_total}", f"{rsi_stops}/{rsi_total}")
     log.info(div)
     log.info("NOTE: TV ratings are CURRENT (live) — not historical.")
-    log.info("      陰陽燭欄：金叉當日前 %d 根K棒內出現看漲形態（晨星/牛市吞沒等）方才進場。", CANDLE_LOOKBACK)
+    log.info("      RSI-14 > 50 is used as a historical proxy for TV BUY signals.")
     log.info(div)
 
 
@@ -1404,20 +1154,19 @@ def run_portfolio_backtest(
         log.info("正在回測股票（%d 隻）…", len(watchlist))
         for symbol in watchlist:
             try:
-                bars_df = get_historical_bars_df(data_client, symbol, lookback_days + 30)
-                if bars_df.empty or len(bars_df) < LONG_MA + 2:
+                closes = get_historical_closes(data_client, symbol, lookback_days + 30)
+                if closes.empty or len(closes) < LONG_MA + 2:
                     log.warning("  %s 數據不足，跳過", symbol)
                     continue
-                closes     = bars_df["close"]
-                ma_res     = _backtest_symbol(closes, symbol, use_candle_filter=False)
-                candle_res = _backtest_symbol(closes, symbol, bars_df=bars_df, use_candle_filter=True)
-                tv         = analyse_stock(symbol)
-                stock_results.append({"symbol": symbol, "ma": ma_res, "candle": candle_res, "tv": tv})
+                ma_res  = _backtest_symbol(closes, symbol, use_rsi_filter=False)
+                rsi_res = _backtest_symbol(closes, symbol, use_rsi_filter=True)
+                tv      = analyse_stock(symbol)
+                stock_results.append({"symbol": symbol, "ma": ma_res, "rsi": rsi_res, "tv": tv})
                 log.info(
-                    "  %s OK — MA: %d 筆 (勝率 %.1f%%) | 燭形: %d 筆 (勝率 %.1f%%) | TV: %s",
+                    "  %s OK — MA: %d 筆 (勝率 %.1f%%) | RSI: %d 筆 (勝率 %.1f%%) | TV: %s",
                     symbol,
-                    ma_res["total"],     ma_res["win_rate"]     * 100,
-                    candle_res["total"], candle_res["win_rate"] * 100,
+                    ma_res["total"],  ma_res["win_rate"]  * 100,
+                    rsi_res["total"], rsi_res["win_rate"] * 100,
                     tv["tv_rating"],
                 )
             except Exception as exc:
@@ -1428,20 +1177,19 @@ def run_portfolio_backtest(
         log.info("正在回測加密貨幣（%d 種）…", len(crypto_watchlist))
         for symbol in crypto_watchlist:
             try:
-                bars_df = get_crypto_historical_bars_df(crypto_client, symbol, lookback_days + 30)
-                if bars_df.empty or len(bars_df) < LONG_MA + 2:
+                closes = get_crypto_historical_closes(crypto_client, symbol, lookback_days + 30)
+                if closes.empty or len(closes) < LONG_MA + 2:
                     log.warning("  %s 數據不足，跳過", symbol)
                     continue
-                closes     = bars_df["close"]
-                ma_res     = _backtest_symbol(closes, symbol, use_candle_filter=False)
-                candle_res = _backtest_symbol(closes, symbol, bars_df=bars_df, use_candle_filter=True)
-                tv         = analyse_crypto(symbol)
-                crypto_results.append({"symbol": symbol, "ma": ma_res, "candle": candle_res, "tv": tv})
+                ma_res  = _backtest_symbol(closes, symbol, use_rsi_filter=False)
+                rsi_res = _backtest_symbol(closes, symbol, use_rsi_filter=True)
+                tv      = analyse_crypto(symbol)
+                crypto_results.append({"symbol": symbol, "ma": ma_res, "rsi": rsi_res, "tv": tv})
                 log.info(
-                    "  %s OK — MA: %d 筆 (勝率 %.1f%%) | 燭形: %d 筆 (勝率 %.1f%%) | TV: %s",
+                    "  %s OK — MA: %d 筆 (勝率 %.1f%%) | RSI: %d 筆 (勝率 %.1f%%) | TV: %s",
                     symbol,
-                    ma_res["total"],     ma_res["win_rate"]     * 100,
-                    candle_res["total"], candle_res["win_rate"] * 100,
+                    ma_res["total"],  ma_res["win_rate"]  * 100,
+                    rsi_res["total"], rsi_res["win_rate"] * 100,
                     tv["tv_rating"],
                 )
             except Exception as exc:
@@ -1456,14 +1204,8 @@ def run_portfolio_backtest(
     _print_portfolio_aggregate(stock_results + crypto_results)
 
     # ── 逐筆交易記錄（筆數少時才顯示）───────────────────────────────
-    all_ma_trades     = sum(r["ma"]["total"]     for r in stock_results + crypto_results)
-    all_candle_trades = sum(r["candle"]["total"] for r in stock_results + crypto_results)
-    if 0 < all_candle_trades <= 120:
-        log.info("")
-        log.info("=== 逐筆交易記錄（MA + 陰陽燭確認）===")
-        for row in stock_results + crypto_results:
-            _print_trade_log(row["symbol"], row["candle"]["trades"])
-    elif 0 < all_ma_trades <= 120:
+    all_ma_trades = sum(r["ma"]["total"] for r in stock_results + crypto_results)
+    if 0 < all_ma_trades <= 120:
         log.info("")
         log.info("=== 逐筆交易記錄（MA-only）===")
         for row in stock_results + crypto_results:
@@ -1473,107 +1215,10 @@ def run_portfolio_backtest(
 
 
 # ----------------------------------------------------------
-# GUI 回測入口（回傳結構化資料 + bars_df，供圖表渲染使用）
-# ----------------------------------------------------------
-def backtest_for_gui(
-    api_key: str,
-    api_secret: str,
-    watchlist: list[str],
-    crypto_watchlist: list[str],
-    lookback_days: int = 365,
-    progress_callback=None,
-) -> dict:
-    """
-    GUI 友好版回測：回傳結構化結果而非僅輸出 log。
-
-    回傳格式：
-      {
-        "stocks":  [{"symbol", "ma", "candle", "tv", "bars_df"}, ...],
-        "crypto":  [{"symbol", "ma", "candle", "tv", "bars_df"}, ...],
-        "errors":  [{"symbol": str, "error": str}, ...],
-      }
-
-    progress_callback(str) 為可選的進度回呼（供 QThread 轉發至 UI Log 面板）。
-    """
-    _emit = progress_callback or log.info
-
-    data_client   = StockHistoricalDataClient(api_key, api_secret)
-    crypto_client = CryptoHistoricalDataClient(api_key, api_secret)
-
-    stock_results:  list[dict] = []
-    crypto_results: list[dict] = []
-    errors:         list[dict] = []
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    _emit(f"[GUI 回測] 開始  |  回溯 {lookback_days} 天  |  {today}")
-
-    # ── 股票 ──────────────────────────────────────────────
-    for symbol in watchlist:
-        try:
-            # 取 lookback_days + 60 天小時，前 60 天供 MA 暖身，不裁切
-            bars_df = get_historical_bars_df(data_client, symbol, lookback_days + 60)
-            if bars_df.empty or len(bars_df) < LONG_MA + 2:
-                _emit(f"  {symbol} 數據不足，跳過")
-                continue
-            closes     = bars_df["close"]
-            ma_res     = _backtest_symbol(closes, symbol, use_candle_filter=False)
-            candle_res = _backtest_symbol(closes, symbol, bars_df=bars_df, use_candle_filter=True)
-            tv         = analyse_stock(symbol)
-            # 圖表僅顯示最近 lookback_days 天，回測則用全部數據
-            chart_df = bars_df.tail(lookback_days)
-            stock_results.append({
-                "symbol":  symbol,
-                "ma":      ma_res,
-                "candle":  candle_res,
-                "tv":      tv,
-                "bars_df": chart_df,
-            })
-            _emit(
-                f"  {symbol} OK — MA: {ma_res['total']} 筆 ({ma_res['win_rate']*100:.1f}%)"
-                f" | 燭形: {candle_res['total']} 筆 ({candle_res['win_rate']*100:.1f}%)"
-                f" | TV: {tv['tv_rating']}"
-            )
-        except Exception as exc:
-            errors.append({"symbol": symbol, "error": str(exc)})
-            _emit(f"  {symbol} 回測失敗：{exc}")
-
-    # ── 加密貨幣 ───────────────────────────────────────────
-    for symbol in crypto_watchlist:
-        try:
-            bars_df = get_crypto_historical_bars_df(crypto_client, symbol, lookback_days + 60)
-            if bars_df.empty or len(bars_df) < LONG_MA + 2:
-                _emit(f"  {symbol} 加密數據不足，跳過")
-                continue
-            closes     = bars_df["close"]
-            ma_res     = _backtest_symbol(closes, symbol, use_candle_filter=False)
-            candle_res = _backtest_symbol(closes, symbol, bars_df=bars_df, use_candle_filter=True)
-            tv         = analyse_crypto(symbol)
-            chart_df = bars_df.tail(lookback_days)
-            crypto_results.append({
-                "symbol":  symbol,
-                "ma":      ma_res,
-                "candle":  candle_res,
-                "tv":      tv,
-                "bars_df": chart_df,
-            })
-            _emit(
-                f"  {symbol} OK — MA: {ma_res['total']} 筆 ({ma_res['win_rate']*100:.1f}%)"
-                f" | 燭形: {candle_res['total']} 筆 ({candle_res['win_rate']*100:.1f}%)"
-                f" | TV: {tv['tv_rating']}"
-            )
-        except Exception as exc:
-            errors.append({"symbol": symbol, "error": str(exc)})
-            _emit(f"  {symbol} 加密回測失敗：{exc}")
-
-    _emit(f"[GUI 回測] 完成  股票 {len(stock_results)} / 加密 {len(crypto_results)} / 錯誤 {len(errors)}")
-    return {"stocks": stock_results, "crypto": crypto_results, "errors": errors}
-
-
-# ----------------------------------------------------------
 # 試跑驗證
 # ----------------------------------------------------------
 def trial_run():
-    log.info("====== Trial Run 開始（V6）======")
+    log.info("====== Trial Run 開始（V5）======")
 
     # 1. 費用計算
     buy_fee  = calc_fee(150.0, 10, is_sell=False)
@@ -1610,26 +1255,13 @@ def trial_run():
     log.info("滾動止損測試：回撤 %.2f%%，應觸發 True -> %s", drawdown * 100, triggered)
     assert triggered, "滾動止損邏輯錯誤！"
 
-    # 5. 陰陽燭形態識別
-    log.info("測試陰陽燭形態識別…")
-    candle_test = pd.DataFrame({
-        "open":  [100.0, 105.0, 103.0],
-        "high":  [110.0, 106.0, 112.0],
-        "low":   [ 90.0, 102.0, 102.0],
-        "close": [104.0, 103.5, 111.0],
-    })
-    result = detect_candle_patterns(candle_test, 2)
-    log.info("陰陽燭測試結果：牛=%s 熊=%s 形態=%s", result["bullish"], result["bearish"], result["patterns"])
-    found, patterns = has_recent_candle_signal(candle_test, 2, "bullish")
-    log.info("近期看漲形態掃描：找到=%s 形態=%s", found, patterns)
-
-    # 6. TradingView 評級（live 網路測試）
+    # 5. TradingView 評級（live 網路測試）
     log.info("測試 TradingView 評級（需要網路）…")
     tv = analyse_stock("NFLX")
     log.info("NFLX TV評級: %s (買:%d 賣:%d) 交易所:%s",
              tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"], tv["exchange"])
 
-    log.info("====== Trial Run 全部通過 ✓（V6）======")
+    log.info("====== Trial Run 全部通過 ✓（V5）======")
     log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%% | CAPITAL_PER_TRADE = $%d",
              PAPER_TRADING, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
@@ -1659,10 +1291,9 @@ def main():
 
     global WATCHLIST
 
-    log.info("=== Alpaca Trading Bot V6 ===")
-    mode_str = "【實盤 LIVE】" if not PAPER_TRADING else "【模擬 PAPER】"
-    log.info("交易模式：%s | 滾動止損 = %.0f%% | 每筆本金 = $%d",
-             mode_str, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
+    log.info("=== Alpaca Trading Bot V5 ===")
+    log.info("PAPER_TRADING = %s | 滾動止損 = %.0f%% | 每筆本金 = $%d",
+             PAPER_TRADING, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
     trading_client = TradingClient(api_key, api_secret, paper=PAPER_TRADING)
     data_client    = StockHistoricalDataClient(api_key, api_secret)
@@ -1769,9 +1400,6 @@ def main():
 
 if __name__ == "__main__":
     if "--live" in sys.argv:
-        # 一鍵切換實盤：若參數含 --real 則設為實盤模式
-        if "--real" in sys.argv:
-            PAPER_TRADING = False
         main()
     elif "--backtest" in sys.argv:
         # 可選：--days N（預設 365 天）
