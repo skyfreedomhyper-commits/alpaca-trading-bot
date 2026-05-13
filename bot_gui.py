@@ -87,6 +87,12 @@ _BASE_STYLE = f"""
     QTabBar::tab:hover:!selected{{color:{C_TEXT};background:{C_BG};}}
 """
 
+def _normalize_crypto_symbol(s: str) -> str:
+    s = s.upper().strip()
+    if "/" in s: return s
+    if s.endswith("USD") and len(s) > 3:
+        return f"{s[:-3]}/USD"
+    return s
 
 # ── Watchlist persistence ────────────────────────────────────────
 def load_watchlist() -> list[str]:
@@ -100,7 +106,8 @@ def load_watchlist() -> list[str]:
             pass
     try:
         import alpaca_trading_bot as _b
-        return list(_b.WATCHLIST)
+        raw = list(_b.WATCHLIST) + list(_b.CRYPTO_WATCHLIST)
+        return sorted(list(set(_normalize_crypto_symbol(s) for s in raw)))
     except Exception:
         return ["NFLX", "TSLA"]
 
@@ -131,12 +138,13 @@ class RefreshWorker(QThread):
         try:
             from alpaca.trading.client import TradingClient
             from alpaca.trading.requests import GetOrdersRequest
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockLatestBarRequest
+            from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+            from alpaca.data.requests import StockLatestBarRequest, CryptoLatestBarRequest
             from alpaca.data.enums import DataFeed
 
             tc = TradingClient(_API_KEY, _API_SECRET, paper=PAPER_TRADING)
-            dc = StockHistoricalDataClient(_API_KEY, _API_SECRET)
+            dc_stock  = StockHistoricalDataClient(_API_KEY, _API_SECRET)
+            dc_crypto = CryptoHistoricalDataClient(_API_KEY, _API_SECRET)
 
             res["account"]   = tc.get_account()
             res["clock"]     = tc.get_clock()
@@ -149,22 +157,47 @@ class RefreshWorker(QThread):
             except Exception:
                 res["orders"] = []
 
-            if self._watchlist:
-                latest = dc.get_stock_latest_bar(
-                    StockLatestBarRequest(
-                        symbol_or_symbols=self._watchlist,
-                        feed=DataFeed.IEX,
+            # 分類處理報價抓取 (使用更強大的識別)
+            stocks = []
+            cryptos = []
+            for s in self._watchlist:
+                norm = _normalize_crypto_symbol(s)
+                if "/" in norm:
+                    cryptos.append(norm)
+                else:
+                    stocks.append(norm)
+
+            if stocks:
+                try:
+                    s_latest = dc_stock.get_stock_latest_bar(
+                        StockLatestBarRequest(symbol_or_symbols=stocks, feed=DataFeed.IEX)
                     )
-                )
-                for s, b in latest.items():
-                    res["bars"][s] = {
-                        "close":  float(b.close),
-                        "high":   float(b.high),
-                        "low":    float(b.low),
-                        "volume": int(b.volume),
-                        "vwap":   float(b.vwap) if b.vwap else 0.0,
-                    }
-                res["prices"] = {s: d["close"] for s, d in res["bars"].items()}
+                    for s, b in s_latest.items():
+                        res["bars"][s] = {
+                            "close":  float(b.close),
+                            "high":   float(b.high),
+                            "low":    float(b.low),
+                            "volume": int(b.volume),
+                            "vwap":   float(b.vwap)
+                        }
+                except Exception: pass
+
+            if cryptos:
+                try:
+                    c_latest = dc_crypto.get_crypto_latest_bar(
+                        CryptoLatestBarRequest(symbol_or_symbols=cryptos)
+                    )
+                    for s, b in c_latest.items():
+                        res["bars"][s] = {
+                            "close":  float(b.close),
+                            "high":   float(b.high),
+                            "low":    float(b.low),
+                            "volume": float(b.volume),
+                            "vwap":   float(b.vwap)
+                        }
+                except Exception: pass
+            
+            res["prices"] = {s: d["close"] for s, d in res["bars"].items()}
 
         except Exception as exc:
             res["error"] = str(exc)
@@ -265,7 +298,7 @@ def _tbl(headers: list[str],
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Alpaca Trading Bot V6 — Dashboard")
+        self.setWindowTitle("Alpaca Trading Bot V7 — Dashboard")
         self.setMinimumSize(1300, 740)
         self.setStyleSheet(_BASE_STYLE)
 
@@ -344,21 +377,18 @@ class MainWindow(QMainWindow):
 
         self._btn_start = QPushButton("▶  啟動 Bot")
         self._btn_start.setToolTip("Paper 交易（需 API Key）")
-        self._btn_start.setStyleSheet(
-            f"QPushButton{{background:{C_GREEN};color:#1e1e2e;border:none;"
-            f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:#b9f0b4;}}"
-            f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
-        self._btn_start.clicked.connect(self._start_bot)
+        self._btn_trial.clicked.connect(self._run_trial)
 
-        self._btn_stop = QPushButton("⏹  停止")
-        self._btn_stop.setEnabled(False)
-        self._btn_stop.setStyleSheet(
-            f"QPushButton{{background:{C_RED};color:#1e1e2e;border:none;"
-            f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:#f5a3b5;}}"
-            f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
-        self._btn_stop.clicked.connect(self._stop_bot)
+        # ── Toggle Start/Stop Button ──
+        self._btn_toggle = QPushButton("▶  啟動")
+        self._style_start = (f"QPushButton{{background:{C_GREEN};color:#1e1e2e;border:none;"
+                             f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
+                             f"QPushButton:hover{{background:#b9f0b4;}}")
+        self._style_stop = (f"QPushButton{{background:{C_RED};color:#1e1e2e;border:none;"
+                            f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
+                            f"QPushButton:hover{{background:#f5a3b5;}}")
+        self._btn_toggle.setStyleSheet(self._style_start)
+        self._btn_toggle.clicked.connect(self._handle_toggle)
 
         self._btn_backtest = QPushButton("📊  回測")
         self._btn_backtest.setToolTip("陰陽燭圖勝率回測（需 API Key）")
@@ -372,19 +402,27 @@ class MainWindow(QMainWindow):
         # ── Mode Toggle Button ──
         self._btn_mode = QPushButton("模式：PAPER")
         self._btn_mode.setToolTip("點擊切換 Paper Trade / 實盤 Trade")
-        self._btn_mode.setFixedWidth(130)
+        self._btn_mode.setFixedWidth(120)
         self._btn_mode.clicked.connect(self._toggle_mode)
         self._update_mode_button()
 
+        # ── Exit Button ──
+        self._btn_exit = QPushButton("✕  結束")
+        self._btn_exit.setStyleSheet(
+            f"QPushButton{{background:{C_CARD};color:{C_RED};border:1px solid {C_RED};"
+            f"border-radius:5px;padding:6px 12px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{C_RED};color:#1e1e2e;}}")
+        self._btn_exit.clicked.connect(self.close)
+
         lay.addWidget(self._btn_trial)
         lay.addSpacing(8)
-        lay.addWidget(self._btn_start)
-        lay.addSpacing(8)
-        lay.addWidget(self._btn_stop)
+        lay.addWidget(self._btn_toggle)
         lay.addSpacing(8)
         lay.addWidget(self._btn_backtest)
         lay.addSpacing(16)
         lay.addWidget(self._btn_mode)
+        lay.addStretch()
+        lay.addWidget(self._btn_exit)
         return bar
 
     # ── tab container ────────────────────────────────────────────
@@ -779,11 +817,23 @@ class MainWindow(QMainWindow):
         bt_busy   = bool(self._bt_worker and self._bt_worker.isRunning())
         return proc_busy or bt_busy
 
+    def _handle_toggle(self):
+        if self._busy():
+            self._stop_bot()
+        else:
+            self._start_bot()
+
     def _set_buttons(self, *, running: bool):
         self._btn_trial.setEnabled(not running)
-        self._btn_start.setEnabled(not running)
-        self._btn_stop.setEnabled(running)
         self._btn_backtest.setEnabled(not running)
+        self._btn_mode.setEnabled(not running)
+        
+        if running:
+            self._btn_toggle.setText("⏹  停止")
+            self._btn_toggle.setStyleSheet(self._style_stop)
+        else:
+            self._btn_toggle.setText("▶  啟動")
+            self._btn_toggle.setStyleSheet(self._style_start)
 
     def _run_trial(self):
         if self._busy():

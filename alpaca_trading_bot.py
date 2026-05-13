@@ -1,14 +1,13 @@
 """
-Alpaca 自動交易機器人 — V6
+Alpaca 自動交易機器人 — V7
 雙均線策略（5日線 / 20日線）
 + TradingView 技術評級雙重確認
 + 陰陽燭形態三重確認（參考 CandleSticker.com）
-+ 2% 滾動止損（Trailing Stop Loss）
-+ 開市前自動選股（5年回測評分）
-+ 24/7 加密貨幣策略（BTC/ETH/SOL/AVAX/LINK）
-+ 持倉股持續監察直至平倉
-+ 瞬斷錯誤分類優化
-+ 投資組合回測（--backtest）：按圖表陰陽燭形態計算勝率
++ 2% 滾動止損（Trailing Stop Loss，持久化 peaks.json）
++ 10 秒高頻監測（股票 & 加密貨幣同步）
++ 全自動加密監控：自動識別 SOLUSD/ETHUSD 格式並監管所有持倉
++ GUI 優化：二合一啟動開關、一鍵切換 Paper/Live 模式
++ 投資組合回測：按圖表陰陽燭形態計算勝率
 
 環境變數設定（建議儲存於 .env 檔案）：
   ALPACA_API_KEY    = 您的 API Key ID
@@ -82,7 +81,7 @@ CAPITAL_PER_TRADE = 10_000
 TRAILING_STOP_PCT = 0.02   # 2%
 
 # 輪詢間隔（秒）
-POLL_INTERVAL = 15
+POLL_INTERVAL = 10
 
 # ============================================================
 # 開市前自動選股設定
@@ -123,7 +122,7 @@ CRYPTO_WATCHLIST = [
     "LINK/USD",   # Chainlink
 ]
 CAPITAL_PER_CRYPTO_TRADE = 1_000   # 每筆加密貨幣交易本金（USD）
-CRYPTO_POLL_INTERVAL     = 300     # 加密策略輪詢間隔（秒，5 分鐘）
+CRYPTO_POLL_INTERVAL     = 10      # 加密策略輪詢間隔（秒）
 
 # ============================================================
 _log_fmt     = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -162,6 +161,16 @@ def save_peaks(peaks: dict[str, float]):
 _position_peaks: dict[str, float] = load_peaks()
 # 本次 session 內已無法取得數據的符號（避免每輪詢重複警告）
 _data_failed_symbols: set[str] = set()
+
+def _normalize_crypto_symbol(s: str) -> str:
+    """自動校正加密貨幣符號格式。例如 SOLUSD -> SOL/USD"""
+    s = s.upper().strip()
+    if "/" in s:
+        return s
+    # 如果是以 USD 結尾且長度大於 3，通常是加密貨幣（如 BTCUSD, ETHUSD, SOLUSD）
+    if s.endswith("USD") and len(s) > 3:
+        return f"{s[:-3]}/USD"
+    return s
 
 
 # ----------------------------------------------------------
@@ -866,7 +875,16 @@ def run_strategy(trading_client: TradingClient, data_client: StockHistoricalData
             with open(WATCHLIST_FILE, encoding="utf-8") as _f:
                 _loaded = _json.load(_f)
             if isinstance(_loaded, list) and _loaded:
-                WATCHLIST = [s.upper().strip() for s in _loaded if s.strip()]
+                # 自動校正清單中的加密貨幣格式
+                raw_list = [s.upper().strip() for s in _loaded if s.strip()]
+                WATCHLIST = []
+                for s in raw_list:
+                    norm = _normalize_crypto_symbol(s)
+                    if "/" in norm:
+                        if norm not in CRYPTO_WATCHLIST:
+                            CRYPTO_WATCHLIST.append(norm)
+                    else:
+                        WATCHLIST.append(norm)
         except Exception:
             pass
 
@@ -882,12 +900,15 @@ def run_strategy(trading_client: TradingClient, data_client: StockHistoricalData
 
     # ── 擴大監察範圍：WATCHLIST ∪ 目前已持股票部位 ──
     watchlist_set  = set(WATCHLIST)
-    _crypto_pos_syms = {_crypto_pos_symbol(s) for s in CRYPTO_WATCHLIST}
     held_extra: list[str] = []
     try:
         for pos in trading_client.get_all_positions():
             sym = pos.symbol
-            if sym not in _crypto_pos_syms and sym not in watchlist_set and float(pos.qty) > 0:
+            # 使用標準化判斷是否為加密貨幣，避免股票邏輯誤抓加密持倉
+            if "/" in _normalize_crypto_symbol(sym):
+                continue
+            
+            if sym not in watchlist_set and float(pos.qty) > 0:
                 held_extra.append(sym)
     except Exception as e:
         log.warning("無法取得持倉清單（僅監察 WATCHLIST）：%s", e)
@@ -1171,10 +1192,12 @@ def run_crypto_strategy(
     try:
         for pos in trading_client.get_all_positions():
             pos_sym = pos.symbol
-            if pos_sym in _pos_to_watch:
-                watch_sym = _pos_to_watch[pos_sym]
-                if watch_sym not in watchlist_set and float(pos.qty) > 1e-8:
-                    held_extra.append(watch_sym)
+            # 判斷是否為加密貨幣：包含 USD 且不是股票 (這裡簡單判斷，如果不在 WATCHLIST 且在 _pos_to_watch 或符合加密命名)
+            # 其實更簡單的做法是：如果 pos_sym 在 _pos_to_watch，用 watch_sym；不在的話，嘗試轉化為帶斜線格式
+            watch_sym = _pos_to_watch.get(pos_sym, _normalize_crypto_symbol(pos_sym))
+            
+            if "/" in watch_sym and watch_sym not in watchlist_set and float(pos.qty) > 1e-8:
+                held_extra.append(watch_sym)
     except Exception as e:
         log.warning("無法取得加密持倉清單（僅監察 CRYPTO_WATCHLIST）：%s", e)
 
