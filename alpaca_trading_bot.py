@@ -1,5 +1,5 @@
 """
-Alpaca 自動交易機器人 — V4
+Alpaca 自動交易機器人 — V5
 雙均線策略（5日線 / 20日線）
 + TradingView 技術評級雙重確認
 + 2% 滾動止損（Trailing Stop Loss）
@@ -7,6 +7,7 @@ Alpaca 自動交易機器人 — V4
 + 24/7 加密貨幣策略（BTC/ETH/SOL/AVAX/LINK）
 + 持倉股持續監察直至平倉
 + 瞬斷錯誤分類優化
++ 投資組合回測（--backtest）：雙重勝率報告 + TradingView 即時評級
 
 環境變數設定（建議儲存於 .env 檔案）：
   ALPACA_API_KEY    = 您的 API Key ID
@@ -16,8 +17,10 @@ Alpaca 自動交易機器人 — V4
   pip install alpaca-py pandas numpy python-dotenv tradingview_ta
 
 使用說明：
-  python -X utf8 alpaca_trading_bot.py          # 試跑驗證
-  python -X utf8 alpaca_trading_bot.py --live   # 連線 Alpaca
+  python -X utf8 alpaca_trading_bot.py                    # 試跑驗證
+  python -X utf8 alpaca_trading_bot.py --live             # 連線 Alpaca 實盤/Paper
+  python -X utf8 alpaca_trading_bot.py --backtest         # 投資組合回測（預設 365 天）
+  python -X utf8 alpaca_trading_bot.py --backtest --days 180  # 自訂回測天數
 """
 
 import os
@@ -284,6 +287,126 @@ def calc_ma_win_rate(closes: pd.Series) -> float:
             in_trade = False
 
     return wins / total if total > 0 else 0.0
+
+
+# ----------------------------------------------------------
+# RSI 計算（供回測使用）
+# ----------------------------------------------------------
+def calc_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder 平滑 RSI，純 pandas 實作（無需外部套件）"""
+    delta    = closes.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+
+# ----------------------------------------------------------
+# 單一標的回測引擎
+# ----------------------------------------------------------
+def _backtest_symbol(
+    closes: pd.Series,
+    symbol: str,
+    use_rsi_filter: bool = False,
+    trailing_stop_pct: float = TRAILING_STOP_PCT,
+) -> dict:
+    """
+    模擬 5/20 均線金叉/死叉策略（含滾動止損）。
+    use_rsi_filter=True 時，金叉進場前須確認 RSI-14 > 50（TV BUY 評級的歷史代理指標）。
+
+    回傳 dict：
+      symbol, trades[], total, wins, losses, win_rate,
+      avg_pnl, best_trade, worst_trade, stop_exits, cross_exits, open_trade
+    """
+    ma_short = closes.rolling(SHORT_MA).mean()
+    ma_long  = closes.rolling(LONG_MA).mean()
+    rsi      = calc_rsi(closes) if use_rsi_filter else None
+
+    trades: list[dict] = []
+    in_trade    = False
+    entry_price = 0.0
+    entry_date  = None
+    peak        = 0.0
+    dates       = closes.index.tolist()
+
+    for i in range(1, len(closes)):
+        ps, cs = ma_short.iloc[i - 1], ma_short.iloc[i]
+        pl, cl = ma_long.iloc[i - 1],  ma_long.iloc[i]
+        if any(pd.isna(x) for x in (ps, cs, pl, cl)):
+            continue
+
+        price = closes.iloc[i]
+
+        if not in_trade:
+            if ps <= pl and cs > cl:   # 金叉進場
+                if use_rsi_filter and (pd.isna(rsi.iloc[i]) or rsi.iloc[i] <= 50):
+                    continue           # RSI 未達 50，跳過本次進場
+                in_trade    = True
+                entry_price = price
+                entry_date  = dates[i]
+                peak        = price
+        else:
+            if price > peak:
+                peak = price
+
+            # 滾動止損優先於死叉出場
+            drawdown = (peak - price) / peak
+            if drawdown >= trailing_stop_pct:
+                trades.append({
+                    "entry_date":  entry_date,
+                    "exit_date":   dates[i],
+                    "entry_price": entry_price,
+                    "exit_price":  price,
+                    "pnl_pct":     (price - entry_price) / entry_price * 100,
+                    "hold_days":   int((dates[i] - entry_date).days),
+                    "exit_type":   "STOP",
+                })
+                in_trade = False
+                continue
+
+            # 死叉出場
+            if ps >= pl and cs < cl:
+                trades.append({
+                    "entry_date":  entry_date,
+                    "exit_date":   dates[i],
+                    "entry_price": entry_price,
+                    "exit_price":  price,
+                    "pnl_pct":     (price - entry_price) / entry_price * 100,
+                    "hold_days":   int((dates[i] - entry_date).days),
+                    "exit_type":   "CROSS",
+                })
+                in_trade = False
+
+    open_trade = None
+    if in_trade:
+        last_price = closes.iloc[-1]
+        open_trade = {
+            "entry_date":         entry_date,
+            "entry_price":        entry_price,
+            "current_price":      last_price,
+            "unrealized_pnl_pct": (last_price - entry_price) / entry_price * 100,
+        }
+
+    wins       = sum(1 for t in trades if t["pnl_pct"] > 0)
+    pnls       = [t["pnl_pct"] for t in trades]
+    stop_exits = sum(1 for t in trades if t["exit_type"] == "STOP")
+
+    return {
+        "symbol":      symbol,
+        "trades":      trades,
+        "total":       len(trades),
+        "wins":        wins,
+        "losses":      len(trades) - wins,
+        "win_rate":    wins / len(trades) if trades else 0.0,
+        "avg_pnl":     float(np.mean(pnls)) if pnls else 0.0,
+        "best_trade":  float(max(pnls)) if pnls else 0.0,
+        "worst_trade": float(min(pnls)) if pnls else 0.0,
+        "stop_exits":  stop_exits,
+        "cross_exits": len(trades) - stop_exits,
+        "open_trade":  open_trade,
+    }
 
 
 # ----------------------------------------------------------
@@ -912,10 +1035,190 @@ def _print_summary(trading_client: TradingClient):
 
 
 # ----------------------------------------------------------
+# 回測輸出輔助函數
+# ----------------------------------------------------------
+def _print_backtest_table(label: str, results: list[dict]) -> None:
+    if not results:
+        log.info("  %s: 無有效數據", label)
+        return
+    hdr = (
+        f"\n  {'Symbol':<10} | {'MA筆數':>6} | {'MA勝率':>7} | {'MA均損益':>8}"
+        f" | {'RSI筆數':>7} | {'RSI勝率':>8} | {'RSI均損益':>9} | {'止損':>5} | TV即時評級"
+    )
+    sep = "  " + "-" * 90
+    log.info("%s  (%d 個標的)", label, len(results))
+    log.info(hdr)
+    log.info(sep)
+    for row in results:
+        ma, rsi, tv = row["ma"], row["rsi"], row["tv"]
+        stop_str = f"{ma['stop_exits']}/{ma['total']}" if ma["total"] else "0/0"
+        log.info(
+            "  %-10s | %6d  | %6.1f%%  | %+7.2f%% | %7d  | %7.1f%%  | %+8.2f%% | %5s | %s",
+            row["symbol"],
+            ma["total"],   ma["win_rate"]  * 100, ma["avg_pnl"],
+            rsi["total"],  rsi["win_rate"] * 100, rsi["avg_pnl"],
+            stop_str, tv["tv_rating"],
+        )
+    log.info(sep)
+
+
+def _print_portfolio_aggregate(results: list[dict]) -> None:
+    div = "=" * 80
+    log.info(div)
+    log.info("PORTFOLIO AGGREGATE")
+    log.info(div)
+    if not results:
+        log.info("  無數據")
+        log.info(div)
+        return
+
+    ma_total  = sum(r["ma"]["total"]  for r in results)
+    rsi_total = sum(r["rsi"]["total"] for r in results)
+    ma_wins   = sum(r["ma"]["wins"]   for r in results)
+    rsi_wins  = sum(r["rsi"]["wins"]  for r in results)
+    ma_stops  = sum(r["ma"]["stop_exits"]  for r in results)
+    rsi_stops = sum(r["rsi"]["stop_exits"] for r in results)
+    ma_pnls   = [t["pnl_pct"] for r in results for t in r["ma"]["trades"]]
+    rsi_pnls  = [t["pnl_pct"] for r in results for t in r["rsi"]["trades"]]
+
+    ma_wr  = ma_wins  / ma_total  if ma_total  else 0.0
+    rsi_wr = rsi_wins / rsi_total if rsi_total else 0.0
+    ma_avg  = float(np.mean(ma_pnls))  if ma_pnls  else 0.0
+    rsi_avg = float(np.mean(rsi_pnls)) if rsi_pnls else 0.0
+
+    log.info("%-24s | %-14s | %-14s", "", "MA-Only", "MA + RSI>50")
+    log.info("%-24s | %-14s | %-14s", "-" * 24, "-" * 14, "-" * 14)
+    log.info("%-24s | %-14s | %-14s", "Completed trades",
+             str(ma_total), str(rsi_total))
+    log.info("%-24s | %-14s | %-14s", "Win rate",
+             f"{ma_wr * 100:.1f}%", f"{rsi_wr * 100:.1f}%")
+    log.info("%-24s | %-14s | %-14s", "Avg trade P&L",
+             f"{ma_avg:+.2f}%", f"{rsi_avg:+.2f}%")
+    log.info("%-24s | %-14s | %-14s", "Stop-loss exits",
+             f"{ma_stops}/{ma_total}", f"{rsi_stops}/{rsi_total}")
+    log.info(div)
+    log.info("NOTE: TV ratings are CURRENT (live) — not historical.")
+    log.info("      RSI-14 > 50 is used as a historical proxy for TV BUY signals.")
+    log.info(div)
+
+
+def _print_trade_log(symbol: str, trades: list[dict]) -> None:
+    if not trades:
+        return
+    log.info("  TRADE LOG — %s", symbol)
+    log.info("  %3s | %-10s | %-10s | %9s | %9s | %7s | %4s | %s",
+             "#", "Entry", "Exit", "Entry $", "Exit $", "P&L%", "Days", "Exit")
+    for i, t in enumerate(trades, 1):
+        log.info("  %3d | %-10s | %-10s | %9.4f | %9.4f | %+6.2f%% | %4d | %s",
+                 i,
+                 str(t["entry_date"])[:10], str(t["exit_date"])[:10],
+                 t["entry_price"], t["exit_price"],
+                 t["pnl_pct"], t["hold_days"], t["exit_type"])
+
+
+# ----------------------------------------------------------
+# 投資組合回測（主入口）
+# ----------------------------------------------------------
+def run_portfolio_backtest(
+    data_client: StockHistoricalDataClient,
+    crypto_client: CryptoHistoricalDataClient,
+    watchlist: list[str],
+    crypto_watchlist: list[str],
+    lookback_days: int = 365,
+) -> None:
+    """
+    對當前投資組合（股票 + 加密貨幣）執行歷史回測，輸出雙重勝率報告：
+      MA-only   — 純 5/20 均線策略（基準）
+      MA+RSI>50 — 加入 RSI-14 > 50 確認（TradingView BUY 評級的歷史代理指標）
+
+    同時拉取各標的的 TradingView 即時評級作為參考。
+
+    CLI:
+      python -X utf8 alpaca_trading_bot.py --backtest
+      python -X utf8 alpaca_trading_bot.py --backtest --days 180
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    div   = "=" * 80
+
+    log.info(div)
+    log.info("PORTFOLIO BACKTEST REPORT  |  Lookback: %d days  |  %s", lookback_days, today)
+    log.info("Strategy: %dMA / %dMA crossover + %.0f%% trailing stop",
+             SHORT_MA, LONG_MA, TRAILING_STOP_PCT * 100)
+    log.info(div)
+
+    stock_results:  list[dict] = []
+    crypto_results: list[dict] = []
+
+    # ── 股票回測 ──────────────────────────────────────────────────
+    if watchlist:
+        log.info("正在回測股票（%d 隻）…", len(watchlist))
+        for symbol in watchlist:
+            try:
+                closes = get_historical_closes(data_client, symbol, lookback_days + 30)
+                if closes.empty or len(closes) < LONG_MA + 2:
+                    log.warning("  %s 數據不足，跳過", symbol)
+                    continue
+                ma_res  = _backtest_symbol(closes, symbol, use_rsi_filter=False)
+                rsi_res = _backtest_symbol(closes, symbol, use_rsi_filter=True)
+                tv      = analyse_stock(symbol)
+                stock_results.append({"symbol": symbol, "ma": ma_res, "rsi": rsi_res, "tv": tv})
+                log.info(
+                    "  %s OK — MA: %d 筆 (勝率 %.1f%%) | RSI: %d 筆 (勝率 %.1f%%) | TV: %s",
+                    symbol,
+                    ma_res["total"],  ma_res["win_rate"]  * 100,
+                    rsi_res["total"], rsi_res["win_rate"] * 100,
+                    tv["tv_rating"],
+                )
+            except Exception as exc:
+                log.warning("  %s 回測失敗：%s", symbol, exc)
+
+    # ── 加密貨幣回測 ───────────────────────────────────────────────
+    if crypto_watchlist:
+        log.info("正在回測加密貨幣（%d 種）…", len(crypto_watchlist))
+        for symbol in crypto_watchlist:
+            try:
+                closes = get_crypto_historical_closes(crypto_client, symbol, lookback_days + 30)
+                if closes.empty or len(closes) < LONG_MA + 2:
+                    log.warning("  %s 數據不足，跳過", symbol)
+                    continue
+                ma_res  = _backtest_symbol(closes, symbol, use_rsi_filter=False)
+                rsi_res = _backtest_symbol(closes, symbol, use_rsi_filter=True)
+                tv      = analyse_crypto(symbol)
+                crypto_results.append({"symbol": symbol, "ma": ma_res, "rsi": rsi_res, "tv": tv})
+                log.info(
+                    "  %s OK — MA: %d 筆 (勝率 %.1f%%) | RSI: %d 筆 (勝率 %.1f%%) | TV: %s",
+                    symbol,
+                    ma_res["total"],  ma_res["win_rate"]  * 100,
+                    rsi_res["total"], rsi_res["win_rate"] * 100,
+                    tv["tv_rating"],
+                )
+            except Exception as exc:
+                log.warning("  %s 加密回測失敗：%s", symbol, exc)
+
+    # ── 輸出報告 ───────────────────────────────────────────────────
+    log.info("")
+    _print_backtest_table("STOCKS", stock_results)
+    log.info("")
+    _print_backtest_table("CRYPTO", crypto_results)
+    log.info("")
+    _print_portfolio_aggregate(stock_results + crypto_results)
+
+    # ── 逐筆交易記錄（筆數少時才顯示）───────────────────────────────
+    all_ma_trades = sum(r["ma"]["total"] for r in stock_results + crypto_results)
+    if 0 < all_ma_trades <= 120:
+        log.info("")
+        log.info("=== 逐筆交易記錄（MA-only）===")
+        for row in stock_results + crypto_results:
+            _print_trade_log(row["symbol"], row["ma"]["trades"])
+    elif all_ma_trades > 120:
+        log.info("（MA 交易筆數共 %d，略過逐筆顯示）", all_ma_trades)
+
+
+# ----------------------------------------------------------
 # 試跑驗證
 # ----------------------------------------------------------
 def trial_run():
-    log.info("====== Trial Run 開始（V2）======")
+    log.info("====== Trial Run 開始（V5）======")
 
     # 1. 費用計算
     buy_fee  = calc_fee(150.0, 10, is_sell=False)
@@ -958,7 +1261,7 @@ def trial_run():
     log.info("NFLX TV評級: %s (買:%d 賣:%d) 交易所:%s",
              tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"], tv["exchange"])
 
-    log.info("====== Trial Run 全部通過 ✓（V2）======")
+    log.info("====== Trial Run 全部通過 ✓（V5）======")
     log.info("PAPER_TRADING = %s | TRAILING_STOP_PCT = %.0f%% | CAPITAL_PER_TRADE = $%d",
              PAPER_TRADING, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
@@ -988,7 +1291,7 @@ def main():
 
     global WATCHLIST
 
-    log.info("=== Alpaca Trading Bot V3 ===")
+    log.info("=== Alpaca Trading Bot V5 ===")
     log.info("PAPER_TRADING = %s | 滾動止損 = %.0f%% | 每筆本金 = $%d",
              PAPER_TRADING, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
@@ -1098,5 +1401,36 @@ def main():
 if __name__ == "__main__":
     if "--live" in sys.argv:
         main()
+    elif "--backtest" in sys.argv:
+        # 可選：--days N（預設 365 天）
+        _bt_days = 365
+        if "--days" in sys.argv:
+            try:
+                _bt_days = int(sys.argv[sys.argv.index("--days") + 1])
+            except (ValueError, IndexError):
+                pass
+
+        _api_key    = os.getenv("ALPACA_API_KEY", "")
+        _api_secret = os.getenv("ALPACA_API_SECRET", "")
+        if not _api_key or not _api_secret:
+            log.error("請設定環境變數 ALPACA_API_KEY 與 ALPACA_API_SECRET")
+            sys.exit(1)
+
+        _dc = StockHistoricalDataClient(_api_key, _api_secret)
+        _cc = CryptoHistoricalDataClient(_api_key, _api_secret)
+
+        # 載入 watchlist.json（若存在），否則沿用模組預設清單
+        _wl = list(WATCHLIST)
+        if os.path.exists(WATCHLIST_FILE):
+            try:
+                import json as _json
+                with open(WATCHLIST_FILE, encoding="utf-8") as _f:
+                    _loaded = _json.load(_f)
+                if isinstance(_loaded, list) and _loaded:
+                    _wl = [s.upper().strip() for s in _loaded if s.strip()]
+            except Exception:
+                pass
+
+        run_portfolio_backtest(_dc, _cc, _wl, CRYPTO_WATCHLIST, lookback_days=_bt_days)
     else:
         trial_run()

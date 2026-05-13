@@ -302,9 +302,19 @@ class MainWindow(QMainWindow):
             f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
         self._btn_stop.clicked.connect(self._stop_bot)
 
+        self._btn_backtest = QPushButton("📊  回測")
+        self._btn_backtest.setStyleSheet(
+            f"QPushButton{{background:{C_PURPLE};color:#1e1e2e;border:none;"
+            f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#d9b8ff;}}"
+            f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
+        self._btn_backtest.clicked.connect(self._run_backtest)
+
         lay.addWidget(self._btn_start)
         lay.addSpacing(8)
         lay.addWidget(self._btn_stop)
+        lay.addSpacing(8)
+        lay.addWidget(self._btn_backtest)
         return bar
 
     # ── tab container ────────────────────────────────────────────
@@ -646,6 +656,31 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(False)
         self._lbl_botstatus.setText("Bot 狀態：已停止")
         self._log_append("[系統] Bot 已停止", C_YELLOW)
+
+    def _run_backtest(self):
+        if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "Bot 執行中", "請先停止 Bot 再執行回測。")
+            return
+        self._process = QProcess(self)
+        python = os.path.join(os.path.dirname(_DIR), ".venv", "Scripts", "python.exe")
+        if not os.path.exists(python):
+            python = sys.executable
+        self._process.setProgram(python)
+        self._process.setArguments(
+            ["-X", "utf8", os.path.join(_DIR, "alpaca_trading_bot.py"), "--backtest"])
+        self._process.setWorkingDirectory(_DIR)
+        self._process.readyReadStandardOutput.connect(self._on_stdout)
+        self._process.readyReadStandardError.connect(self._on_stderr)
+        self._process.finished.connect(self._on_backtest_done)
+        self._process.start()
+        self._btn_backtest.setEnabled(False)
+        self._btn_start.setEnabled(False)
+        self._log_append("[系統] 回測已啟動，結果將顯示於此記錄面板…", C_PURPLE)
+
+    def _on_backtest_done(self):
+        self._btn_backtest.setEnabled(True)
+        self._btn_start.setEnabled(True)
+        self._log_append("[系統] 回測完成", C_PURPLE)
 
     def _on_stdout(self):
         raw = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
