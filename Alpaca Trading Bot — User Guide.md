@@ -5,8 +5,8 @@ tags:
   - python
   - automation
 created: 2026-05-09
-updated: 2026-05-13
-version: v4
+updated: 2026-05-15
+version: v3.1
 status: active
 ---
 
@@ -22,7 +22,8 @@ status: active
 
 | 版本 | 日期 | 主要更新 |
 |---|---|---|
-| **v4** (現行) | 2026-05-13 | 24/7 加密貨幣策略、持倉監察至平倉、GUI Dashboard、瞬斷錯誤分類、單一 log 檔 |
+| **v3.1** (現行) | 2026-05-15 | 修復 `trading_view_backtest_bot.py` 語法錯誤（escaped quotes 導致 SyntaxError） |
+| v4 | 2026-05-13 | 24/7 加密貨幣策略、持倉監察至平倉、GUI Dashboard、瞬斷錯誤分類、單一 log 檔 |
 | v3 | 2026-05-12 | 開市前自動選股（5年回測評分）、watchlist.json 共用狀態、IEX 資料覆蓋修正（X→NVDA） |
 | v2 | 2026-05-11 | TradingView 雙重確認、2% 滾動止損、動態本金部位、擴充觀察清單 |
 | v1 | 2026-05-09 | 雙均線策略、固定股數、2 小時結算報告 |
@@ -464,4 +465,4 @@ Ctrl + C   (terminal)   or   ⏹ Stop Bot   (GUI)
 
 ---
 
-*Last updated: 2026-05-13 | Version: v4 | SDK: alpaca-py 0.43.4 · tradingview_ta 3.3.0 · PyQt6*
+*Last updated: 2026-05-15 | Version: v3.1 | SDK: alpaca-py 0.43.4 · tradingview_ta 3.3.0 · PyQt6*
