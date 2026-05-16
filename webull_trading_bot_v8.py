@@ -1,11 +1,12 @@
 """
-Webull 自動交易機器人 — V8
+Webull 自動交易機器人 — V8.1
 雙均線策略（5日線 / 20日線）
 + TradingView 技術評級雙重確認
 + 陰陽燭形態三重確認（參考 CandleSticker.com）
 + 2% 滾動止損（Trailing Stop Loss，持久化 peaks.json）
-+ 10 秒高頻監測（股票 & 加密貨幣同步）
-+ Webull OpenAPI SDK（webull-openapi-python-sdk v2.0.7）
++ 10 秒高頻監測
++ 歷史行情 & 即時報價由 yfinance（Yahoo Finance）提供（無需 Webull 數據 API 憑證）
++ Webull OpenAPI SDK（webull-openapi-python-sdk v2.0.7）— 僅用於下單 & 帳戶
 
 環境變數設定（建議儲存於 .env 檔案）：
   WEBULL_APP_KEY    = 您的 Webull App Key
@@ -46,11 +47,10 @@ except ImportError:
 from webull.core.http.initializer.client_initializer import ClientInitializer
 ClientInitializer._check_token_enable = staticmethod(lambda _: False)
 
+import yfinance as yf
+
 from webull.core.client import ApiClient
 from webull.trade.trade_client import TradeClient
-from webull.data.data_client import DataClient
-from webull.data.common.category import Category
-from webull.data.common.timespan import Timespan
 
 from tradingview_ta import TA_Handler, Interval
 
@@ -66,8 +66,6 @@ WEBULL_PAPER = True
 # ============================================================
 TRADE_ENDPOINT_PAPER = "us-openapi-alb.uat.webullbroker.com"
 TRADE_ENDPOINT_LIVE  = "api.webull.com"
-DATA_ENDPOINT_PAPER  = "us-openapi-alb.uat.webullbroker.com"   # same host as trade
-DATA_ENDPOINT_LIVE   = "api.webull.com"                          # same host as trade
 
 # ============================================================
 # 監控股票清單（美股代碼）
@@ -103,19 +101,6 @@ SCREEN_LOOKBACK_YEARS = 5
 
 WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
 PEAKS_FILE     = os.path.join(os.path.dirname(__file__), "peaks.json")
-
-# ============================================================
-# 加密貨幣設定（24/7，內部用 BTC/USD 格式；Webull API 用 BTCUSD）
-# ============================================================
-CRYPTO_WATCHLIST = [
-    "BTC/USD",
-    "ETH/USD",
-    "SOL/USD",
-    "AVAX/USD",
-    "LINK/USD",
-]
-CAPITAL_PER_CRYPTO_TRADE = 1_000
-CRYPTO_POLL_INTERVAL     = 10
 
 # ============================================================
 # 日誌
@@ -155,23 +140,6 @@ _account_id: str = ""   # 啟動後由 init_clients() 填入
 
 
 # ----------------------------------------------------------
-# 符號格式轉換
-# ----------------------------------------------------------
-def _normalize_crypto_symbol(s: str) -> str:
-    """自動校正：SOLUSD → SOL/USD（內部統一斜線格式）"""
-    s = s.upper().strip()
-    if "/" in s:
-        return s
-    if s.endswith("USD") and len(s) > 3:
-        return f"{s[:-3]}/USD"
-    return s
-
-def _wb_symbol(symbol: str) -> str:
-    """BTC/USD → BTCUSD（Webull API 格式）"""
-    return symbol.replace("/", "")
-
-
-# ----------------------------------------------------------
 # 市場時段判斷（取代 Alpaca clock API）
 # ----------------------------------------------------------
 def _is_market_open() -> bool:
@@ -206,91 +174,6 @@ def _get_next_market_open() -> datetime:
 # ----------------------------------------------------------
 # Webull 回應解析輔助函數
 # ----------------------------------------------------------
-def _parse_bars_response(resp, symbol: str) -> pd.DataFrame:
-    """解析 Webull get_history_bar / get_crypto_history_bar 回應 → OHLCV DataFrame"""
-    try:
-        data = resp.json()
-        # 嘗試多種可能的回應結構
-        bars_list = None
-        if isinstance(data, list):
-            bars_list = data
-        elif isinstance(data, dict):
-            bars_list = (
-                data.get("data") or
-                data.get("bars") or
-                (data.get("result") or {}).get("data") or
-                []
-            )
-            # 有些回應把單一 symbol 的 bars 包在 data.{symbol}
-            if isinstance(bars_list, dict):
-                bars_list = bars_list.get(symbol) or bars_list.get(_wb_symbol(symbol)) or []
-
-        if not bars_list:
-            log.debug("%s K線回應無數據。原始：%s", symbol, str(data)[:300])
-            return pd.DataFrame()
-
-        rows = []
-        for b in bars_list:
-            try:
-                ts_raw = (b.get("timestamp") or b.get("time") or
-                          b.get("t") or b.get("tradeTime") or b.get("openTime"))
-                if ts_raw is None:
-                    continue
-                ts = pd.Timestamp(int(ts_raw), unit="ms", tz="UTC")
-                rows.append({
-                    "timestamp": ts,
-                    "open":   float(b.get("open")   or b.get("openPrice")  or b.get("o") or 0),
-                    "high":   float(b.get("high")   or b.get("highPrice")  or b.get("h") or 0),
-                    "low":    float(b.get("low")    or b.get("lowPrice")   or b.get("l") or 0),
-                    "close":  float(b.get("close")  or b.get("closePrice") or b.get("c") or 0),
-                    "volume": float(b.get("volume") or b.get("vol")        or b.get("v") or 0),
-                })
-            except Exception:
-                continue
-
-        if not rows:
-            log.debug("%s K線解析後無有效行", symbol)
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows).set_index("timestamp").sort_index()
-        return df[["open", "high", "low", "close", "volume"]]
-
-    except Exception as e:
-        raw = getattr(resp, "text", "")[:300]
-        log.warning("%s 解析K線失敗：%s | 原始：%s", symbol, e, raw)
-        return pd.DataFrame()
-
-
-def _parse_snapshot_price(resp, wb_symbol: str) -> float | None:
-    """解析 Webull get_snapshot / get_crypto_snapshot 回應 → 最新收盤價"""
-    try:
-        data = resp.json()
-        items = data if isinstance(data, list) else (
-            data.get("data") or data.get("items") or []
-        )
-        if not items:
-            return None
-        # 找到符合 symbol 的項目
-        for item in items:
-            sym = item.get("symbol") or item.get("ticker") or ""
-            if sym.upper() == wb_symbol.upper() or not wb_symbol:
-                price = (item.get("close") or item.get("lastPrice") or
-                         item.get("last") or item.get("price"))
-                if price is not None:
-                    return float(price)
-        # 若只有一個項目，直接取
-        if len(items) == 1:
-            item = items[0]
-            price = (item.get("close") or item.get("lastPrice") or
-                     item.get("last") or item.get("price"))
-            if price is not None:
-                return float(price)
-        return None
-    except Exception as e:
-        log.warning("%s 解析快照失敗：%s", wb_symbol, e)
-        return None
-
-
 def _parse_positions(resp) -> list[dict]:
     """解析 get_account_position 回應 → list of position dicts"""
     try:
@@ -347,25 +230,17 @@ def _parse_order_history(resp) -> list[dict]:
 # ----------------------------------------------------------
 def init_clients(app_key: str, app_secret: str, paper: bool = True):
     """
-    建立 TradeClient 和 DataClient 並返回 (trade_client, data_client, account_id)。
-    paper=True 使用 UAT 端點，paper=False 使用正式端點。
+    建立 TradeClient 並返回 (trade_client, account_id)。
+    歷史行情與即時報價改由 yfinance（Yahoo Finance）提供，無需 DataClient。
     """
     trade_ep = TRADE_ENDPOINT_PAPER if paper else TRADE_ENDPOINT_LIVE
-    data_ep  = DATA_ENDPOINT_PAPER  if paper else DATA_ENDPOINT_LIVE
 
     trade_api = ApiClient(app_key, app_secret, "us")
     trade_api.add_endpoint("us", trade_ep)
-    trade_api._stream_logger_set = True   # 防止 SDK 覆蓋日誌設定
+    trade_api._stream_logger_set = True
     trade_api._file_logger_set   = True
     trade_client = TradeClient(trade_api)
 
-    data_api = ApiClient(app_key, app_secret, "us")
-    data_api.add_endpoint("us", data_ep)
-    data_api._stream_logger_set = True
-    data_api._file_logger_set   = True
-    data_client = DataClient(data_api)
-
-    # 取得帳戶 ID
     account_id = ""
     try:
         resp = trade_client.account_v2.get_account_list()
@@ -380,8 +255,8 @@ def init_clients(app_key: str, app_secret: str, paper: bool = True):
     except Exception as e:
         log.warning("取得帳戶清單失敗：%s", e)
 
-    log.info("Webull 客戶端初始化完成 | 端點：%s | 帳戶 ID：%s", trade_ep, account_id or "未知")
-    return trade_client, data_client, account_id
+    log.info("Webull 交易客戶端初始化完成 | 端點：%s | 帳戶 ID：%s", trade_ep, account_id or "未知")
+    return trade_client, account_id
 
 
 # ----------------------------------------------------------
@@ -422,26 +297,28 @@ def analyse_stock(symbol: str) -> dict:
 
 
 # ----------------------------------------------------------
-# 歷史行情（OHLCV）— 股票
+# 歷史行情（OHLCV）— yfinance (Yahoo Finance)
 # ----------------------------------------------------------
-def get_historical_bars_df(data_client: DataClient, symbol: str, days: int) -> pd.DataFrame:
-    """抓取最近 N 個交易日完整 OHLCV（供均線計算及陰陽燭識別）"""
-    count = str(min(days + 30, 1200))
+def get_historical_bars_df(symbol: str, days: int) -> pd.DataFrame:
+    """抓取最近 N 個交易日完整 OHLCV（yfinance，無需 API 憑證）"""
     try:
-        resp = data_client.market_data.get_history_bar(
-            symbol, Category.US_STOCK.name, Timespan.D.name, count=count
-        )
-        df = _parse_bars_response(resp, symbol)
+        # Fetch extra calendar days to ensure enough trading days after weekends/holidays
+        start = (datetime.now(timezone.utc) - timedelta(days=int(days * 1.6) + 30)).strftime("%Y-%m-%d")
+        end   = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        df = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
-        return df.tail(days)
+        df = df.rename(columns={"Open": "open", "High": "high",
+                                 "Low": "low", "Close": "close", "Volume": "volume"})
+        df.index = pd.to_datetime(df.index, utc=True)
+        return df[["open", "high", "low", "close", "volume"]].tail(days)
     except Exception as e:
-        log.warning("%s 抓取歷史K線失敗：%s", symbol, e)
+        log.warning("%s yfinance K線失敗：%s", symbol, e)
         return pd.DataFrame()
 
 
-def get_historical_closes(data_client: DataClient, symbol: str, days: int) -> pd.Series:
-    df = get_historical_bars_df(data_client, symbol, days)
+def get_historical_closes(symbol: str, days: int) -> pd.Series:
+    df = get_historical_bars_df(symbol, days)
     return df["close"] if not df.empty else pd.Series(dtype=float)
 
 
@@ -636,19 +513,18 @@ def _backtest_symbol(closes, symbol, bars_df=None, use_candle_filter=False,
 # ----------------------------------------------------------
 # 開市前自動選股
 # ----------------------------------------------------------
-def screen_stocks(data_client: DataClient) -> list:
+def screen_stocks() -> list:
     log.info("=== 開市前選股開始（候選：%d 隻，回溯：%d 年）===",
              len(SCREEN_CANDIDATES), SCREEN_LOOKBACK_YEARS)
-    count = str(min(SCREEN_LOOKBACK_YEARS * 260 + 60, 1200))
     results: dict[str, dict] = {}
     for symbol in SCREEN_CANDIDATES:
         try:
-            resp = data_client.market_data.get_history_bar(
-                symbol, Category.US_STOCK.name, Timespan.D.name, count=count
-            )
-            sym_df = _parse_bars_response(resp, symbol)
+            sym_df = yf.Ticker(symbol).history(
+                period=f"{SCREEN_LOOKBACK_YEARS}y", auto_adjust=True)
             if sym_df.empty or len(sym_df) < 252:
                 continue
+            sym_df = sym_df.rename(columns={"Open": "open", "High": "high",
+                                             "Low": "low", "Close": "close", "Volume": "volume"})
             closes  = sym_df["close"]
             volumes = sym_df["volume"]
             highs   = sym_df["high"]
@@ -661,7 +537,7 @@ def screen_stocks(data_client: DataClient) -> list:
                      symbol, f"{avg_vol:,.0f}", daily_range, win_rate * 100)
         except Exception as exc:
             log.debug("%s 選股失敗：%s", symbol, exc)
-        time.sleep(0.3)
+        time.sleep(0.1)
 
     if not results:
         log.warning("選股結果為空，保留原觀察清單：%s", WATCHLIST)
@@ -694,10 +570,9 @@ def get_current_position(trade_client: TradeClient | None, symbol: str,
     try:
         resp      = trade_client.account_v2.get_account_position(_account_id)
         positions = _parse_positions(resp)
-        wb_sym    = _wb_symbol(symbol)
         for p in positions:
             pos_sym = (p.get("symbol") or p.get("ticker") or "").upper()
-            if pos_sym in (symbol.upper(), wb_sym.upper()):
+            if pos_sym == symbol.upper():
                 qty  = float(p.get("qty") or p.get("quantity") or p.get("holdingQty") or 0)
                 cost = float(p.get("avgCost") or p.get("costPrice") or
                              p.get("avgEntryPrice") or p.get("avg_cost") or 0)
@@ -708,21 +583,16 @@ def get_current_position(trade_client: TradeClient | None, symbol: str,
 
 
 # ----------------------------------------------------------
-# 即時報價
+# 即時報價 — yfinance
 # ----------------------------------------------------------
-def get_latest_price(data_client: DataClient, symbol: str) -> float | None:
+def get_latest_price(symbol: str) -> float | None:
     try:
-        resp  = data_client.market_data.get_snapshot([symbol], Category.US_STOCK.name)
-        price = _parse_snapshot_price(resp, symbol)
-        if price is not None:
-            return price
-        # 退回到最後一根 K 棒
-        bars = get_historical_bars_df(data_client, symbol, 1)
-        if not bars.empty:
-            return float(bars["close"].iloc[-1])
+        hist = yf.Ticker(symbol).history(period="2d", auto_adjust=True)
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
         return None
     except Exception as e:
-        log.warning("%s 取得即時報價失敗：%s", symbol, e)
+        log.warning("%s yfinance 即時報價失敗：%s", symbol, e)
         return None
 
 
@@ -731,10 +601,6 @@ def get_latest_price(data_client: DataClient, symbol: str) -> float | None:
 # ----------------------------------------------------------
 def place_order(trade_client: TradeClient | None, symbol: str, side: str,
                 quantity: int, price: float, reason: str = "", trial: bool = False):
-    """
-    side: "BUY" or "SELL"
-    quantity: 整數股數（股票）或浮點數（加密，傳入 int 後由呼叫方調整）
-    """
     fee_info   = calc_fee(price, int(quantity), is_sell=(side == "SELL"))
     mode_label = "試跑" if trial else ("UAT" if WEBULL_PAPER else "實盤")
     log.info("[%s] %s %s %s @ %.4f | 費用：%s | 原因：%s",
@@ -758,31 +624,28 @@ def place_order(trade_client: TradeClient | None, symbol: str, side: str,
         log.info("[試跑] 持倉更新 %s: %s", symbol, pos)
         return
 
-    wb_sym    = _wb_symbol(symbol)
-    is_crypto = "/" in symbol
-    inst_type = "CRYPTO" if is_crypto else "STOCK"
     order_dict = {
         "combo_type":              "NORMAL",
         "client_order_id":         str(uuid.uuid4()),
-        "symbol":                  wb_sym,
-        "instrument_type":         inst_type,
+        "symbol":                  symbol,
+        "instrument_type":         "STOCK",
         "market":                  "US",
         "order_type":              "MARKET",
         "quantity":                str(quantity),
         "support_trading_session": "CORE",
         "side":                    side,
-        "time_in_force":           "GTC" if is_crypto else "DAY",
+        "time_in_force":           "DAY",
         "entrust_type":            "QTY",
     }
     resp = trade_client.order_v2.place_order(_account_id, [order_dict])
-    log.info("[%s] 訂單已提交 %s | 回應：%s", mode_label, wb_sym, str(resp.json())[:200])
+    log.info("[%s] 訂單已提交 %s | 回應：%s", mode_label, symbol, str(resp.json())[:200])
 
 
 # ----------------------------------------------------------
 # 滾動止損
 # ----------------------------------------------------------
-def update_trailing_stop(trade_client: TradeClient | None, data_client: DataClient | None,
-                         symbol: str, trial: bool = False):
+def update_trailing_stop(trade_client: TradeClient | None, symbol: str,
+                         trial: bool = False):
     pos = get_current_position(trade_client, symbol, trial=trial)
     qty = pos["quantity"]
     if (qty if isinstance(qty, float) else int(qty)) <= 0:
@@ -791,7 +654,7 @@ def update_trailing_stop(trade_client: TradeClient | None, data_client: DataClie
         return
     if trial:
         return
-    current_price = get_latest_price(data_client, symbol)
+    current_price = get_latest_price(symbol)
     if current_price is None:
         return
     if symbol not in _position_peaks:
@@ -816,7 +679,7 @@ def update_trailing_stop(trade_client: TradeClient | None, data_client: DataClie
 # ----------------------------------------------------------
 # 主策略輪詢（股票）
 # ----------------------------------------------------------
-def run_strategy(trade_client: TradeClient, data_client: DataClient):
+def run_strategy(trade_client: TradeClient):
     global WATCHLIST
     if os.path.exists(WATCHLIST_FILE):
         try:
@@ -824,15 +687,7 @@ def run_strategy(trade_client: TradeClient, data_client: DataClient):
             with open(WATCHLIST_FILE, encoding="utf-8") as _f:
                 _loaded = _json.load(_f)
             if isinstance(_loaded, list) and _loaded:
-                raw_list = [s.upper().strip() for s in _loaded if s.strip()]
-                WATCHLIST = []
-                for s in raw_list:
-                    norm = _normalize_crypto_symbol(s)
-                    if "/" in norm:
-                        if norm not in CRYPTO_WATCHLIST:
-                            CRYPTO_WATCHLIST.append(norm)
-                    else:
-                        WATCHLIST.append(norm)
+                WATCHLIST = [s.upper().strip() for s in _loaded if s.strip()]
         except Exception:
             pass
 
@@ -848,9 +703,6 @@ def run_strategy(trade_client: TradeClient, data_client: DataClient):
         positions = _parse_positions(resp)
         for p in positions:
             sym = (p.get("symbol") or p.get("ticker") or "").upper()
-            sym = _normalize_crypto_symbol(sym)
-            if "/" in sym:
-                continue
             qty = float(p.get("qty") or p.get("quantity") or p.get("holdingQty") or 0)
             if sym not in watchlist_set and qty > 0:
                 held_extra.append(sym)
@@ -866,8 +718,8 @@ def run_strategy(trade_client: TradeClient, data_client: DataClient):
         try:
             label = symbol if in_watchlist else f"{symbol} [持倉監察]"
             log.info("--- 處理 %s ---", label)
-            update_trailing_stop(trade_client, data_client, symbol)
-            bars_df = get_historical_bars_df(data_client, symbol, LONG_MA + BUY_WINDOW + 5)
+            update_trailing_stop(trade_client, symbol)
+            bars_df = get_historical_bars_df(symbol, LONG_MA + BUY_WINDOW + 5)
             if bars_df.empty:
                 if symbol not in _data_failed_symbols:
                     log.warning("%s 無法取得歷史行情，本 session 後續靜默跳過", symbol)
@@ -897,7 +749,7 @@ def run_strategy(trade_client: TradeClient, data_client: DataClient):
                              symbol, tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"],
                              ma_signal, candle_str, decision)
                     if allow_entry:
-                        current_price = get_latest_price(data_client, symbol) or float(closes.iloc[-1])
+                        current_price = get_latest_price(symbol) or float(closes.iloc[-1])
                         qty    = max(1, int(CAPITAL_PER_TRADE / current_price))
                         reason = f"TV+MA+燭形三重確認（{candle_str}）"
                         place_order(trade_client, symbol, "BUY", qty, current_price, reason)
@@ -905,204 +757,12 @@ def run_strategy(trade_client: TradeClient, data_client: DataClient):
                         save_peaks(_position_peaks)
             elif ma_signal == "SELL" and pos["quantity"] > 0:
                 log.info("[分析] %s | MA: SELL | 決策: ✅ 死叉平倉", symbol)
-                current_price = get_latest_price(data_client, symbol) or float(closes.iloc[-1])
+                current_price = get_latest_price(symbol) or float(closes.iloc[-1])
                 place_order(trade_client, symbol, "SELL", int(pos["quantity"]), current_price, "均線死叉賣出")
             else:
                 log.info("%s 無操作（MA=%s，持倉=%s）", symbol, ma_signal, pos["quantity"])
         except Exception as exc:
             log.error("%s 處理出錯：%s", symbol, exc, exc_info=True)
-
-
-# ----------------------------------------------------------
-# 加密貨幣工具
-# ----------------------------------------------------------
-def analyse_crypto(symbol: str) -> dict:
-    tv_sym = _wb_symbol(symbol)
-    for exchange in ("COINBASE", "BINANCE"):
-        try:
-            handler  = TA_Handler(symbol=tv_sym, screener="crypto",
-                                  exchange=exchange, interval=Interval.INTERVAL_1_DAY)
-            analysis = handler.get_analysis()
-            rec      = analysis.summary["RECOMMENDATION"]
-            return {"tv_rating": rec, "tv_buy_count": analysis.summary["BUY"],
-                    "tv_sell_count": analysis.summary["SELL"],
-                    "bullish": rec in ("BUY", "STRONG_BUY"), "exchange": exchange}
-        except Exception:
-            continue
-    log.warning("%s 無法取得 TradingView 加密評級", symbol)
-    return {"tv_rating": "UNKNOWN", "tv_buy_count": 0, "tv_sell_count": 0, "bullish": False, "exchange": "N/A"}
-
-
-def get_crypto_historical_bars_df(data_client: DataClient, symbol: str, days: int) -> pd.DataFrame:
-    wb_sym = _wb_symbol(symbol)
-    count  = str(min(days + 30, 1200))
-    try:
-        resp = data_client.crypto_market_data.get_crypto_history_bar(
-            [wb_sym], Category.US_CRYPTO.name, Timespan.D.name, count=count
-        )
-        df = _parse_bars_response(resp, wb_sym)
-        if df.empty:
-            return pd.DataFrame()
-        return df.tail(days)
-    except Exception as e:
-        log.warning("%s 抓取加密K線失敗：%s", symbol, e)
-        return pd.DataFrame()
-
-
-def get_crypto_historical_closes(data_client: DataClient, symbol: str, days: int) -> pd.Series:
-    df = get_crypto_historical_bars_df(data_client, symbol, days)
-    return df["close"] if not df.empty else pd.Series(dtype=float)
-
-
-def get_crypto_latest_price(data_client: DataClient, symbol: str) -> float | None:
-    wb_sym = _wb_symbol(symbol)
-    try:
-        resp  = data_client.crypto_market_data.get_crypto_snapshot([wb_sym])
-        price = _parse_snapshot_price(resp, wb_sym)
-        if price is not None:
-            return price
-        bars = get_crypto_historical_bars_df(data_client, symbol, 1)
-        if not bars.empty:
-            return float(bars["close"].iloc[-1])
-        return None
-    except Exception as e:
-        log.warning("%s 取得加密即時報價失敗：%s", symbol, e)
-        return None
-
-
-def get_crypto_position(trade_client: TradeClient, symbol: str) -> dict:
-    wb_sym = _wb_symbol(symbol)
-    try:
-        resp      = trade_client.account_v2.get_account_position(_account_id)
-        positions = _parse_positions(resp)
-        for p in positions:
-            pos_sym = (p.get("symbol") or p.get("ticker") or "").upper()
-            if pos_sym in (symbol.upper(), wb_sym.upper()):
-                qty  = float(p.get("qty") or p.get("quantity") or p.get("holdingQty") or 0)
-                cost = float(p.get("avgCost") or p.get("costPrice") or
-                             p.get("avgEntryPrice") or p.get("avg_cost") or 0)
-                return {"quantity": qty, "avg_cost": cost}
-        return {"quantity": 0.0, "avg_cost": 0.0}
-    except Exception:
-        return {"quantity": 0.0, "avg_cost": 0.0}
-
-
-def place_crypto_order(trade_client: TradeClient, symbol: str, side: str,
-                       qty: float, price: float, reason: str = ""):
-    qty = round(qty, 8)
-    log.info("[%s][加密] %s %s %.8f @ $%.4f | ~$%.2f | 原因：%s",
-             "UAT" if WEBULL_PAPER else "實盤", side, symbol, qty, price, qty * price, reason)
-    if side == "SELL":
-        _position_peaks.pop(symbol, None)
-        save_peaks(_position_peaks)
-    wb_sym = _wb_symbol(symbol)
-    order_dict = {
-        "combo_type":              "NORMAL",
-        "client_order_id":         str(uuid.uuid4()),
-        "symbol":                  wb_sym,
-        "instrument_type":         "CRYPTO",
-        "market":                  "US",
-        "order_type":              "MARKET",
-        "quantity":                str(qty),
-        "support_trading_session": "CORE",
-        "side":                    side,
-        "time_in_force":           "GTC",
-        "entrust_type":            "QTY",
-    }
-    resp = trade_client.order_v2.place_order(_account_id, [order_dict])
-    log.info("[加密] 訂單已提交 %s | 回應：%s", wb_sym, str(resp.json())[:200])
-
-
-def update_crypto_trailing_stop(trade_client: TradeClient, data_client: DataClient, symbol: str):
-    pos = get_crypto_position(trade_client, symbol)
-    if pos["quantity"] <= 1e-8:
-        _position_peaks.pop(symbol, None)
-        save_peaks(_position_peaks)
-        return
-    current_price = get_crypto_latest_price(data_client, symbol)
-    if current_price is None:
-        return
-    if symbol not in _position_peaks:
-        _position_peaks[symbol] = current_price
-        save_peaks(_position_peaks)
-        log.info("[加密] %s 滾動止損啟動，初始峰值：$%.4f", symbol, current_price)
-    peak = _position_peaks[symbol]
-    if current_price > peak:
-        peak = current_price
-        _position_peaks[symbol] = peak
-        save_peaks(_position_peaks)
-        log.info("[加密] %s 峰值更新：$%.4f", symbol, peak)
-    drawdown = (peak - current_price) / peak
-    log.info("%s 加密滾動止損：當前 $%.4f | 峰值 $%.4f | 回撤 %.2f%%",
-             symbol, current_price, peak, drawdown * 100)
-    if drawdown >= TRAILING_STOP_PCT:
-        log.warning("[加密滾動止損] %s 從峰值 $%.4f 回落 %.2f%%，觸發平倉！",
-                    symbol, peak, drawdown * 100)
-        place_crypto_order(trade_client, symbol, "SELL", pos["quantity"], current_price, "加密滾動止損平倉")
-
-
-def run_crypto_strategy(trade_client: TradeClient, data_client: DataClient):
-    _pos_to_watch: dict[str, str] = {_wb_symbol(s): s for s in CRYPTO_WATCHLIST}
-    watchlist_set = set(CRYPTO_WATCHLIST)
-    held_extra: list[str] = []
-    try:
-        resp      = trade_client.account_v2.get_account_position(_account_id)
-        positions = _parse_positions(resp)
-        for p in positions:
-            pos_sym   = (p.get("symbol") or p.get("ticker") or "").upper()
-            watch_sym = _pos_to_watch.get(pos_sym, _normalize_crypto_symbol(pos_sym))
-            qty       = float(p.get("qty") or p.get("quantity") or p.get("holdingQty") or 0)
-            if "/" in watch_sym and watch_sym not in watchlist_set and qty > 1e-8:
-                held_extra.append(watch_sym)
-    except Exception as e:
-        log.warning("無法取得加密持倉清單：%s", e)
-
-    if held_extra:
-        log.info("[加密持倉監察] %s", held_extra)
-
-    monitor_list = list(CRYPTO_WATCHLIST) + held_extra
-    log.info("=== 加密策略輪詢（%d 種）===", len(monitor_list))
-    for symbol in monitor_list:
-        in_watchlist = symbol in watchlist_set
-        try:
-            log.info("--- 加密 %s ---", symbol if in_watchlist else f"{symbol} [持倉監察]")
-            update_crypto_trailing_stop(trade_client, data_client, symbol)
-            closes = get_crypto_historical_closes(data_client, symbol, LONG_MA + BUY_WINDOW + 5)
-            if closes.empty:
-                if symbol not in _data_failed_symbols:
-                    log.warning("%s 無法取得加密歷史行情，本 session 後續靜默跳過", symbol)
-                    _data_failed_symbols.add(symbol)
-                continue
-            ma_signal = compute_signal(closes)
-            pos       = get_crypto_position(trade_client, symbol)
-            if ma_signal == "BUY" and pos["quantity"] <= 1e-8:
-                if not in_watchlist:
-                    log.info("%s [持倉監察] MA金叉但已移出清單，不新增", symbol)
-                else:
-                    tv = analyse_crypto(symbol)
-                    if tv["tv_rating"] == "UNKNOWN":
-                        allow_entry = True; decision = "⚠️ TV不可用，僅憑MA信號入市"
-                    else:
-                        allow_entry = tv["bullish"]
-                        decision = "✅ 允許入市" if allow_entry else "❌ TV評級不足，跳過"
-                    log.info("[加密分析] %s | TV: %s (%d/%d) | MA: %s | 決策: %s",
-                             symbol, tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"],
-                             ma_signal, decision)
-                    if allow_entry:
-                        cp = get_crypto_latest_price(data_client, symbol) or float(closes.iloc[-1])
-                        buy_qty = CAPITAL_PER_CRYPTO_TRADE / cp
-                        reason  = "加密TV+MA買入" if tv["tv_rating"] != "UNKNOWN" else "加密MA金叉（TV不可用）"
-                        place_crypto_order(trade_client, symbol, "BUY", buy_qty, cp, reason)
-                        _position_peaks[symbol] = cp
-                        save_peaks(_position_peaks)
-            elif ma_signal == "SELL" and pos["quantity"] > 1e-8:
-                log.info("[加密分析] %s | MA: SELL | 決策: ✅ 死叉平倉", symbol)
-                cp = get_crypto_latest_price(data_client, symbol) or float(closes.iloc[-1])
-                place_crypto_order(trade_client, symbol, "SELL", pos["quantity"], cp, "加密死叉賣出")
-            else:
-                log.info("%s 無操作（MA=%s，持倉=%.8f）", symbol, ma_signal, pos["quantity"])
-        except Exception as exc:
-            log.error("%s 加密處理出錯：%s", symbol, exc, exc_info=True)
 
 
 # ----------------------------------------------------------
@@ -1193,8 +853,7 @@ def _print_trade_log(symbol: str, trades: list[dict]) -> None:
 # ----------------------------------------------------------
 # 投資組合回測（主入口）
 # ----------------------------------------------------------
-def run_portfolio_backtest(data_client: DataClient, watchlist: list[str],
-                           crypto_watchlist: list[str], lookback_days: int = 365) -> None:
+def run_portfolio_backtest(watchlist: list[str], lookback_days: int = 365) -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     div   = "=" * 80
     log.info(div)
@@ -1202,13 +861,12 @@ def run_portfolio_backtest(data_client: DataClient, watchlist: list[str],
     log.info("Strategy: %dMA / %dMA crossover + %.0f%% trailing stop",
              SHORT_MA, LONG_MA, TRAILING_STOP_PCT * 100)
     log.info(div)
-    stock_results:  list[dict] = []
-    crypto_results: list[dict] = []
+    stock_results: list[dict] = []
     if watchlist:
         log.info("正在回測股票（%d 隻）…", len(watchlist))
         for symbol in watchlist:
             try:
-                bars_df = get_historical_bars_df(data_client, symbol, lookback_days + 30)
+                bars_df = get_historical_bars_df(symbol, lookback_days + 30)
                 if bars_df.empty or len(bars_df) < LONG_MA + 2:
                     log.warning("  %s 數據不足，跳過", symbol); continue
                 closes     = bars_df["close"]
@@ -1218,61 +876,38 @@ def run_portfolio_backtest(data_client: DataClient, watchlist: list[str],
                 stock_results.append({"symbol": symbol, "ma": ma_res, "candle": candle_res, "tv": tv})
             except Exception as exc:
                 log.warning("  %s 回測失敗：%s", symbol, exc)
-    if crypto_watchlist:
-        log.info("正在回測加密貨幣（%d 種）…", len(crypto_watchlist))
-        for symbol in crypto_watchlist:
-            try:
-                bars_df = get_crypto_historical_bars_df(data_client, symbol, lookback_days + 30)
-                if bars_df.empty or len(bars_df) < LONG_MA + 2:
-                    log.warning("  %s 數據不足，跳過", symbol); continue
-                closes     = bars_df["close"]
-                ma_res     = _backtest_symbol(closes, symbol, use_candle_filter=False)
-                candle_res = _backtest_symbol(closes, symbol, bars_df=bars_df, use_candle_filter=True)
-                tv         = analyse_crypto(symbol)
-                crypto_results.append({"symbol": symbol, "ma": ma_res, "candle": candle_res, "tv": tv})
-            except Exception as exc:
-                log.warning("  %s 加密回測失敗：%s", symbol, exc)
     log.info("")
     _print_backtest_table("STOCKS", stock_results)
     log.info("")
-    _print_backtest_table("CRYPTO", crypto_results)
-    log.info("")
-    _print_portfolio_aggregate(stock_results + crypto_results)
-    all_ct = sum(r["candle"]["total"] for r in stock_results + crypto_results)
-    all_mt = sum(r["ma"]["total"]     for r in stock_results + crypto_results)
+    _print_portfolio_aggregate(stock_results)
+    all_ct = sum(r["candle"]["total"] for r in stock_results)
+    all_mt = sum(r["ma"]["total"]     for r in stock_results)
     if 0 < all_ct <= 120:
         log.info("")
         log.info("=== 逐筆交易記錄（MA + 陰陽燭確認）===")
-        for row in stock_results + crypto_results:
+        for row in stock_results:
             _print_trade_log(row["symbol"], row["candle"]["trades"])
     elif 0 < all_mt <= 120:
         log.info("")
         log.info("=== 逐筆交易記錄（MA-only）===")
-        for row in stock_results + crypto_results:
+        for row in stock_results:
             _print_trade_log(row["symbol"], row["ma"]["trades"])
 
 
 # ----------------------------------------------------------
 # GUI 回測入口（Webull 版）
 # ----------------------------------------------------------
-def backtest_for_gui(app_key: str, app_secret: str, watchlist: list[str],
-                     crypto_watchlist: list[str], lookback_days: int = 365,
-                     progress_callback=None, paper: bool = True) -> dict:
+def backtest_for_gui(watchlist: list[str], lookback_days: int = 365,
+                     progress_callback=None, **_) -> dict:
+    """歷史數據由 yfinance 提供，無需 API 憑證。"""
     _emit = progress_callback or log.info
-    data_ep  = DATA_ENDPOINT_PAPER if paper else DATA_ENDPOINT_LIVE
-    data_api = ApiClient(app_key, app_secret, "us")
-    data_api.add_endpoint("us", data_ep)
-    data_api._stream_logger_set = True
-    data_api._file_logger_set   = True
-    data_client = DataClient(data_api)
     stock_results: list[dict] = []
-    crypto_results: list[dict] = []
     errors: list[dict] = []
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _emit(f"[GUI 回測] 開始  |  回溯 {lookback_days} 天  |  {today}")
     for symbol in watchlist:
         try:
-            bars_df = get_historical_bars_df(data_client, symbol, lookback_days + 60)
+            bars_df = get_historical_bars_df(symbol, lookback_days + 60)
             if bars_df.empty or len(bars_df) < LONG_MA + 2:
                 _emit(f"  {symbol} 數據不足，跳過"); continue
             closes     = bars_df["close"]
@@ -1288,33 +923,15 @@ def backtest_for_gui(app_key: str, app_secret: str, watchlist: list[str],
         except Exception as exc:
             errors.append({"symbol": symbol, "error": str(exc)})
             _emit(f"  {symbol} 回測失敗：{exc}")
-    for symbol in crypto_watchlist:
-        try:
-            bars_df = get_crypto_historical_bars_df(data_client, symbol, lookback_days + 60)
-            if bars_df.empty or len(bars_df) < LONG_MA + 2:
-                _emit(f"  {symbol} 加密數據不足，跳過"); continue
-            closes     = bars_df["close"]
-            ma_res     = _backtest_symbol(closes, symbol, use_candle_filter=False)
-            candle_res = _backtest_symbol(closes, symbol, bars_df=bars_df, use_candle_filter=True)
-            tv         = analyse_crypto(symbol)
-            chart_df   = bars_df.tail(lookback_days)
-            crypto_results.append({"symbol": symbol, "ma": ma_res, "candle": candle_res,
-                                    "tv": tv, "bars_df": chart_df})
-            _emit(f"  {symbol} OK — MA: {ma_res['total']} 筆 ({ma_res['win_rate']*100:.1f}%)"
-                  f" | 燭形: {candle_res['total']} 筆 ({candle_res['win_rate']*100:.1f}%)"
-                  f" | TV: {tv['tv_rating']}")
-        except Exception as exc:
-            errors.append({"symbol": symbol, "error": str(exc)})
-            _emit(f"  {symbol} 加密回測失敗：{exc}")
-    _emit(f"[GUI 回測] 完成  股票 {len(stock_results)} / 加密 {len(crypto_results)} / 錯誤 {len(errors)}")
-    return {"stocks": stock_results, "crypto": crypto_results, "errors": errors}
+    _emit(f"[GUI 回測] 完成  股票 {len(stock_results)} / 錯誤 {len(errors)}")
+    return {"stocks": stock_results, "errors": errors}
 
 
 # ----------------------------------------------------------
 # 試跑驗證（不需 API）
 # ----------------------------------------------------------
 def trial_run():
-    log.info("====== Trial Run 開始（V8 Webull）======")
+    log.info("====== Trial Run 開始（V8.1 Webull）======")
 
     # 1. 費用計算
     buy_fee  = calc_fee(150.0, 10, is_sell=False)
@@ -1329,10 +946,9 @@ def trial_run():
     next_open = _get_next_market_open()
     log.info("市場狀態：%s | 下次開盤：%s", "開盤" if is_open else "休市", next_open.strftime("%Y-%m-%d %H:%M %Z"))
 
-    # 3. 符號轉換
-    assert _wb_symbol("BTC/USD") == "BTCUSD"
-    assert _normalize_crypto_symbol("SOLUSD") == "SOL/USD"
-    log.info("符號轉換測試通過")
+    # 3. 符號格式
+    assert WATCHLIST[0].isalpha(), "觀察清單格式正常"
+    log.info("觀察清單格式測試通過")
 
     # 4. 均線信號
     np.random.seed(42)
@@ -1379,7 +995,7 @@ def trial_run():
     log.info("NFLX TV: %s (買:%d 賣:%d) 交易所:%s",
              tv["tv_rating"], tv["tv_buy_count"], tv["tv_sell_count"], tv["exchange"])
 
-    log.info("====== Trial Run 全部通過 ✓（V8 Webull）======")
+    log.info("====== Trial Run 全部通過 ✓（V8.1 Webull）======")
     log.info("WEBULL_PAPER = %s | TRAILING_STOP_PCT = %.0f%% | CAPITAL_PER_TRADE = $%d",
              WEBULL_PAPER, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
@@ -1409,12 +1025,12 @@ def main():
         log.error("請設定環境變數 WEBULL_APP_KEY 與 WEBULL_APP_SECRET")
         sys.exit(1)
 
-    log.info("=== Webull Trading Bot V8 ===")
+    log.info("=== Webull Trading Bot V8.1 ===")
     mode_str = "【UAT 模擬】" if WEBULL_PAPER else "【實盤 LIVE】"
     log.info("交易模式：%s | 滾動止損 = %.0f%% | 每筆本金 = $%d",
              mode_str, TRAILING_STOP_PCT * 100, CAPITAL_PER_TRADE)
 
-    trade_client, data_client, account_id = init_clients(app_key, app_secret, paper=WEBULL_PAPER)
+    trade_client, account_id = init_clients(app_key, app_secret, paper=WEBULL_PAPER)
     _account_id = account_id
 
     # 顯示帳戶資訊
@@ -1426,15 +1042,12 @@ def main():
         log.warning("無法取得帳戶資訊：%s", e)
 
     log.info("觀察清單：%s", WATCHLIST)
-    log.info("加密貨幣清單：%s", CRYPTO_WATCHLIST)
 
-    run_duration    = 86400
-    end_time        = time.time() + run_duration
-    screened_date   = None
-    _last_crypto_ts = 0.0
+    run_duration  = 86400
+    end_time      = time.time() + run_duration
+    screened_date = None
 
-    log.info("開始策略輪詢（股票每 %d 秒 / 加密每 %d 秒），執行時間：24 小時…",
-             POLL_INTERVAL, CRYPTO_POLL_INTERVAL)
+    log.info("開始策略輪詢（每 %d 秒），執行時間：24 小時…", POLL_INTERVAL)
 
     try:
         while time.time() < end_time:
@@ -1447,25 +1060,13 @@ def main():
                     sleep_secs = max(0.0, (next_open - now_utc).total_seconds())
                     log.info("市場收市，暫停至 %s（約 %.0f 分鐘後）…",
                              next_open.strftime("%Y-%m-%d %H:%M %Z"), sleep_secs / 60)
-
-                    wake_at = time.time() + sleep_secs
-                    while time.time() < wake_at and time.time() < end_time:
-                        next_crypto_ts = _last_crypto_ts + CRYPTO_POLL_INTERVAL
-                        sleep_until    = min(wake_at, end_time, next_crypto_ts)
-                        sleep_dur      = max(1.0, sleep_until - time.time())
-                        time.sleep(sleep_dur)
-                        if time.time() >= next_crypto_ts:
-                            try:
-                                run_crypto_strategy(trade_client, data_client)
-                            except Exception as _exc:
-                                log.warning("加密策略出錯：%s", _exc)
-                            _last_crypto_ts = time.time()
+                    time.sleep(min(sleep_secs, end_time - time.time(), 60.0))
 
                     today = datetime.now(timezone.utc).date()
-                    if screened_date != today:
+                    if screened_date != today and _is_market_open():
                         log.info("市場即將開市，執行開市前選股…")
                         try:
-                            WATCHLIST     = screen_stocks(data_client)
+                            WATCHLIST     = screen_stocks()
                             screened_date = today
                             _sync_watchlist_file(WATCHLIST)
                         except Exception as exc:
@@ -1475,20 +1076,13 @@ def main():
                     if screened_date != today:
                         log.info("開市中啟動，執行開市前選股…")
                         try:
-                            WATCHLIST     = screen_stocks(data_client)
+                            WATCHLIST     = screen_stocks()
                             screened_date = today
                             _sync_watchlist_file(WATCHLIST)
                         except Exception as exc:
                             log.warning("選股失敗，保留現有清單：%s", exc)
 
-                    run_strategy(trade_client, data_client)
-
-                    if time.time() - _last_crypto_ts >= CRYPTO_POLL_INTERVAL:
-                        try:
-                            run_crypto_strategy(trade_client, data_client)
-                        except Exception as _exc:
-                            log.warning("加密策略出錯：%s", _exc)
-                        _last_crypto_ts = time.time()
+                    run_strategy(trade_client)
 
                     remaining = end_time - time.time()
                     if remaining > 0:
@@ -1523,17 +1117,6 @@ if __name__ == "__main__":
                 _bt_days = int(sys.argv[sys.argv.index("--days") + 1])
             except (ValueError, IndexError):
                 pass
-        _app_key    = os.getenv("WEBULL_APP_KEY", "")
-        _app_secret = os.getenv("WEBULL_APP_SECRET", "")
-        if not _app_key or not _app_secret:
-            log.error("請設定環境變數 WEBULL_APP_KEY 與 WEBULL_APP_SECRET")
-            sys.exit(1)
-        _data_ep  = DATA_ENDPOINT_PAPER if WEBULL_PAPER else DATA_ENDPOINT_LIVE
-        _data_api = ApiClient(_app_key, _app_secret, "us")
-        _data_api.add_endpoint("us", _data_ep)
-        _data_api._stream_logger_set = True
-        _data_api._file_logger_set   = True
-        _dc = DataClient(_data_api)
         _wl = list(WATCHLIST)
         if os.path.exists(WATCHLIST_FILE):
             try:
@@ -1544,6 +1127,6 @@ if __name__ == "__main__":
                     _wl = [s.upper().strip() for s in _loaded if s.strip()]
             except Exception:
                 pass
-        run_portfolio_backtest(_dc, _wl, CRYPTO_WATCHLIST, lookback_days=_bt_days)
+        run_portfolio_backtest(_wl, lookback_days=_bt_days)
     else:
         trial_run()

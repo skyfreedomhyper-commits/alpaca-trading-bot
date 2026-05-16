@@ -97,13 +97,6 @@ _BASE_STYLE = f"""
     QTabBar::tab:hover:!selected{{color:{C_TEXT};background:{C_BG};}}
 """
 
-def _normalize_crypto_symbol(s: str) -> str:
-    s = s.upper().strip()
-    if "/" in s: return s
-    if s.endswith("USD") and len(s) > 3:
-        return f"{s[:-3]}/USD"
-    return s
-
 # ── Watchlist persistence ────────────────────────────────────────
 def load_watchlist() -> list[str]:
     if os.path.exists(WATCHLIST_FILE):
@@ -116,8 +109,7 @@ def load_watchlist() -> list[str]:
             pass
     try:
         import webull_trading_bot_v8 as _b
-        raw = list(_b.WATCHLIST) + list(_b.CRYPTO_WATCHLIST)
-        return sorted(list(set(_normalize_crypto_symbol(s) for s in raw)))
+        return sorted(list(set(s.upper().strip() for s in _b.WATCHLIST)))
     except Exception:
         return ["NFLX", "TSLA"]
 
@@ -171,7 +163,7 @@ class _PositionProxy:
             except: return 0.0
 
         wb_sym = (raw.get("symbol") or raw.get("tickerSymbol") or raw.get("ticker") or "")
-        self.symbol          = _normalize_crypto_symbol(wb_sym)
+        self.symbol          = wb_sym.upper().strip()
         self.qty             = _f(raw.get("position") or raw.get("quantity") or raw.get("qty"))
         self.avg_entry_price = _f(raw.get("averageCost") or raw.get("avgCost")
                                   or raw.get("costPrice") or raw.get("cost"))
@@ -194,7 +186,7 @@ class _OrderProxy:
             except: return None
 
         wb_sym         = (raw.get("symbol") or raw.get("tickerSymbol") or "")
-        self.symbol    = _normalize_crypto_symbol(wb_sym)
+        self.symbol    = wb_sym.upper().strip()
         self.side      = (raw.get("side") or raw.get("action") or "").upper()
         self.status    = (raw.get("status") or raw.get("orderStatus") or "--").upper()
 
@@ -264,23 +256,14 @@ class RefreshWorker(QThread):
 
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
-            from webull.data.data_client import DataClient
-            from webull.data.common.category import Category
 
             trade_ep = TRADE_ENDPOINT_PAPER if WEBULL_PAPER else TRADE_ENDPOINT_LIVE
-            data_ep  = DATA_ENDPOINT_PAPER  if WEBULL_PAPER else DATA_ENDPOINT_LIVE
 
             trade_api = ApiClient(_APP_KEY, _APP_SECRET, "us")
             trade_api.add_endpoint("us", trade_ep)
             trade_api._stream_logger_set = True
             trade_api._file_logger_set   = True
             trade_client = TradeClient(trade_api)
-
-            data_api = ApiClient(_APP_KEY, _APP_SECRET, "us")
-            data_api.add_endpoint("us", data_ep)
-            data_api._stream_logger_set = True
-            data_api._file_logger_set   = True
-            data_client = DataClient(data_api)
 
             # Fetch account_id
             acct_list_resp = trade_client.account_v2.get_account_list()
@@ -329,59 +312,21 @@ class RefreshWorker(QThread):
             except Exception:
                 res["orders"] = []
 
-            # Latest prices via snapshot
-            stocks  = []
-            cryptos = []
-            for s in self._watchlist:
-                norm = _normalize_crypto_symbol(s)
-                if "/" in norm:
-                    cryptos.append(norm)
-                else:
-                    stocks.append(norm)
-
-            if stocks:
+            # Latest prices via yfinance (no credentials needed)
+            import yfinance as yf
+            stocks = [s.upper().strip() for s in self._watchlist]
+            for sym in stocks:
                 try:
-                    snap_resp = data_client.market_data.get_snapshot(
-                        stocks, Category.US_STOCK.name)
-                    snap_raw = snap_resp.json()
-                    if isinstance(snap_raw, list):
-                        for item in snap_raw:
-                            sym = (item.get("symbol") or item.get("ticker") or "").upper()
-                            if sym:
-                                res["bars"][sym] = _extract_bar_from_snapshot(item)
-                    elif isinstance(snap_raw, dict):
-                        inner = snap_raw.get("data") or snap_raw
-                        if isinstance(inner, dict):
-                            for sym_key in stocks:
-                                item = inner.get(sym_key) or {}
-                                if item:
-                                    res["bars"][sym_key] = _extract_bar_from_snapshot(item)
-                        elif isinstance(inner, list):
-                            for item in inner:
-                                sym = (item.get("symbol") or item.get("ticker") or "").upper()
-                                if sym:
-                                    res["bars"][sym] = _extract_bar_from_snapshot(item)
-                except Exception:
-                    pass
-
-            if cryptos:
-                try:
-                    wb_cryptos  = [s.replace("/", "") for s in cryptos]
-                    snap_resp   = data_client.crypto_market_data.get_crypto_snapshot(
-                        wb_cryptos, Category.US_CRYPTO.name)
-                    snap_raw    = snap_resp.json()
-                    if isinstance(snap_raw, list):
-                        for item in snap_raw:
-                            wb_sym   = (item.get("symbol") or "").upper()
-                            norm_sym = _normalize_crypto_symbol(wb_sym)
-                            if norm_sym:
-                                res["bars"][norm_sym] = _extract_bar_from_snapshot(item)
-                    elif isinstance(snap_raw, dict):
-                        inner = snap_raw.get("data") or snap_raw
-                        for wb_sym, norm_sym in zip(wb_cryptos, cryptos):
-                            item = (inner.get(wb_sym) or {}) if isinstance(inner, dict) else {}
-                            if item:
-                                res["bars"][norm_sym] = _extract_bar_from_snapshot(item)
+                    hist = yf.Ticker(sym).history(period="2d", auto_adjust=True)
+                    if not hist.empty:
+                        last = hist.iloc[-1]
+                        res["bars"][sym] = {
+                            "close":  float(last["Close"]),
+                            "high":   float(last["High"]),
+                            "low":    float(last["Low"]),
+                            "volume": float(last["Volume"]),
+                            "vwap":   float(last["Close"]),
+                        }
                 except Exception:
                     pass
 
@@ -398,30 +343,22 @@ class BacktestWorker(QThread):
     done     = pyqtSignal(dict)
     progress = pyqtSignal(str)
 
-    def __init__(self, app_key: str, app_secret: str,
-                 watchlist: list, crypto_watchlist: list,
-                 lookback_days: int = 365):
+    def __init__(self, watchlist: list, lookback_days: int = 365):
         super().__init__()
-        self._app_key          = app_key
-        self._app_secret       = app_secret
-        self._watchlist        = list(watchlist)
-        self._crypto_watchlist = list(crypto_watchlist)
-        self._lookback_days    = lookback_days
+        self._watchlist     = list(watchlist)
+        self._lookback_days = lookback_days
 
     def run(self):
         try:
             import webull_trading_bot_v8 as _b
             results = _b.backtest_for_gui(
-                app_key          = self._app_key,
-                app_secret       = self._app_secret,
                 watchlist        = self._watchlist,
-                crypto_watchlist = self._crypto_watchlist,
                 lookback_days    = self._lookback_days,
                 progress_callback= lambda msg: self.progress.emit(str(msg)),
             )
         except Exception as exc:
             results = {
-                "stocks": [], "crypto": [],
+                "stocks": [],
                 "errors": [{"symbol": "SYSTEM", "error": str(exc)}],
             }
         self.done.emit(results)
@@ -1119,34 +1056,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "執行中", "請先停止當前任務再執行回測。")
             return
 
-        if not _APP_KEY or not _APP_SECRET:
-            # No credentials — text-only fallback via QProcess
-            self._process = QProcess(self)
-            self._process.setProgram(self._get_python())
-            self._process.setArguments(
-                ["-X", "utf8",
-                 os.path.join(_DIR, "webull_trading_bot_v8.py"), "--backtest"])
-            self._process.setWorkingDirectory(_DIR)
-            self._process.readyReadStandardOutput.connect(self._on_stdout)
-            self._process.readyReadStandardError.connect(self._on_stderr)
-            self._process.finished.connect(self._on_backtest_done_text)
-            self._process.start()
-            self._set_buttons(running=True)
-            self._lbl_botstatus.setText(
-                f"Bot 狀態：<span style='color:{C_PURPLE}'>回測中（文字模式）</span>")
-            self._log_append("[系統] 未設定 API Key，以文字模式執行回測…", C_PURPLE)
-            return
-
-        try:
-            import webull_trading_bot_v8 as _b
-            cwl = list(_b.CRYPTO_WATCHLIST)
-        except Exception:
-            cwl = []
-
-        self._bt_worker = BacktestWorker(
-            _APP_KEY, _APP_SECRET,
-            self._gui_watchlist, cwl, lookback_days=365,
-        )
+        self._bt_worker = BacktestWorker(self._gui_watchlist, lookback_days=365)
         self._bt_worker.progress.connect(
             lambda msg: self._log_append(f"[回測] {msg}", C_PURPLE))
         self._bt_worker.done.connect(self._on_backtest_results)
@@ -1300,7 +1210,7 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-        all_rows = results.get("stocks", []) + results.get("crypto", [])
+        all_rows = results.get("stocks", [])
         self._bt_all_rows = all_rows
 
         if not all_rows:
@@ -1374,7 +1284,7 @@ class MainWindow(QMainWindow):
         self._set_buttons(running=False)
         self._lbl_botstatus.setText("Bot 狀態：已停止")
 
-        total  = len(results.get("stocks", [])) + len(results.get("crypto", []))
+        total  = len(results.get("stocks", []))
         errors = results.get("errors", [])
         self._log_append(
             f"[系統] 回測完成 ✓  成功 {total} 個標的，錯誤 {len(errors)} 個",
