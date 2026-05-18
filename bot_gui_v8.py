@@ -29,8 +29,9 @@ from PyQt6.QtWidgets import (
 _DIR           = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_FILE = os.path.join(_DIR, "watchlist.json")
 load_dotenv(os.path.join(_DIR, ".env"))
-_APP_KEY    = os.getenv("WEBULL_APP_KEY",    "")
-_APP_SECRET = os.getenv("WEBULL_APP_SECRET", "")
+_APP_KEY      = os.getenv("WEBULL_APP_KEY",      "")
+_APP_SECRET   = os.getenv("WEBULL_APP_SECRET",   "")
+_ACCESS_TOKEN = os.getenv("WEBULL_ACCESS_TOKEN", "")
 WEBULL_PAPER = True  # True=UAT endpoint, False=prod endpoint
 
 # Patch Webull SDK: skip token-check init (US endpoints don't expose /openapi/config)
@@ -117,6 +118,21 @@ def load_watchlist() -> list[str]:
 def save_watchlist(symbols: list[str]):
     with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
         json.dump(symbols, f, indent=2)
+
+
+def _reload_env():
+    """Re-read .env so newly-written WEBULL_ACCESS_TOKEN is picked up."""
+    global _APP_KEY, _APP_SECRET, _ACCESS_TOKEN
+    load_dotenv(os.path.join(_DIR, ".env"), override=True)
+    _APP_KEY      = os.getenv("WEBULL_APP_KEY",      "")
+    _APP_SECRET   = os.getenv("WEBULL_APP_SECRET",   "")
+    _ACCESS_TOKEN = os.getenv("WEBULL_ACCESS_TOKEN", "")
+
+
+def _mask_token(token: str) -> str:
+    if not token:
+        return "未設定"
+    return token[:8] + "…" + token[-4:] if len(token) > 12 else token[:4] + "****"
 
 
 # ── Webull API proxy objects ─────────────────────────────────────
@@ -520,6 +536,14 @@ class MainWindow(QMainWindow):
             f"QPushButton:disabled{{background:{C_BORDER};color:{C_SUBTEXT};}}")
         self._btn_backtest.clicked.connect(self._run_backtest)
 
+        self._btn_token = QPushButton("🔑  Token")
+        self._btn_token.setToolTip("建立 / 更新 Webull HK Access Token（在新終端視窗執行）")
+        self._btn_token.setStyleSheet(
+            f"QPushButton{{background:#fab387;color:#1e1e2e;border:none;"
+            f"border-radius:5px;padding:6px 18px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#fcd0b0;}}")
+        self._btn_token.clicked.connect(self._run_token_script)
+
         # ── Mode Toggle Button ──
         self._btn_mode = QPushButton("模式：UAT")
         self._btn_mode.setToolTip("點擊切換 UAT（模擬）/ 實盤 Trade")
@@ -540,6 +564,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._btn_toggle)
         lay.addSpacing(8)
         lay.addWidget(self._btn_backtest)
+        lay.addSpacing(8)
+        lay.addWidget(self._btn_token)
         lay.addSpacing(16)
         lay.addWidget(self._btn_mode)
         lay.addStretch()
@@ -596,7 +622,8 @@ class MainWindow(QMainWindow):
         box, bl = self._card("📊  帳戶資訊", TAB_ACCOUNT)
         self._ov_acct: dict[str, QLabel] = {}
         for k, label in [("equity", "淨值"), ("buying_power", "可用資金"),
-                         ("mode", "交易模式"), ("status", "帳戶狀態")]:
+                         ("mode", "交易模式"), ("status", "帳戶狀態"),
+                         ("token", "Token")]:
             row = QHBoxLayout()
             row.addWidget(_lbl(label + "：", color=C_SUBTEXT))
             v = _lbl("--", bold=True)
@@ -667,6 +694,10 @@ class MainWindow(QMainWindow):
                 ("trading_blocked",      "交易限制"),
                 ("transfers_blocked",    "轉帳限制"),
                 ("account_blocked",      "帳戶鎖定"),
+            ]),
+            ("🔑  Token 認證", [
+                ("token_status", "狀態"),
+                ("token_value",  "Token"),
             ]),
         ]
         for sec_title, fields in sections:
@@ -944,6 +975,28 @@ class MainWindow(QMainWindow):
         else:
             self._btn_toggle.setText("▶  啟動")
             self._btn_toggle.setStyleSheet(self._style_start)
+
+    def _run_token_script(self):
+        """Launch create_webull_hk_token.py in a new PowerShell console window."""
+        python = self._get_python()
+        script = os.path.join(_DIR, "create_webull_hk_token.py")
+        if not os.path.exists(script):
+            QMessageBox.warning(self, "找不到腳本",
+                                f"找不到 Token 建立腳本：\n{script}")
+            return
+        import subprocess
+        try:
+            subprocess.Popen(
+                ["powershell.exe", "-NoExit", "-Command",
+                 f"& '{python}' -X utf8 '{script}'"],
+                cwd=_DIR,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            self._log_append("[Token] 已在新視窗啟動 Token 建立程式…", "#fab387")
+            self._log_append("[Token] 完成後請稍候 — 儀表板每 30 秒自動更新 Token 狀態",
+                             C_SUBTEXT)
+        except Exception as exc:
+            self._log_append(f"[Token 錯誤] 無法開啟腳本：{exc}", C_RED)
 
     def _run_trial(self):
         if self._busy():
@@ -1307,6 +1360,7 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def _on_data(self, data: dict):
+        _reload_env()  # pick up newly-written WEBULL_ACCESS_TOKEN
         if data["error"]:
             self._log_append(f"[刷新錯誤] {data['error']}", C_YELLOW)
 
@@ -1331,6 +1385,12 @@ class MainWindow(QMainWindow):
                 f"color:{C_GREEN if ok else C_YELLOW};background:transparent;"
                 f"font-weight:bold;")
             self._ov_acct["status"].setText(str(acc.status).upper())
+
+        has_token = bool(_ACCESS_TOKEN)
+        self._ov_acct["token"].setStyleSheet(
+            f"color:{C_GREEN if has_token else C_RED};background:transparent;font-weight:bold;")
+        self._ov_acct["token"].setText(
+            _mask_token(_ACCESS_TOKEN) + "  ✓" if has_token else "未設定  ✗")
 
         clk = data["clock"]
         if clk:
@@ -1389,6 +1449,14 @@ class MainWindow(QMainWindow):
           "是" if getattr(acc, "transfers_blocked", False) else "否")
         s("account_blocked",
           "是" if getattr(acc, "account_blocked", False) else "否")
+
+        has_token = bool(_ACCESS_TOKEN)
+        s("token_status", "已設定 ✓" if has_token else "未設定 ✗")
+        if "token_status" in self._acct_vals:
+            self._acct_vals["token_status"].setStyleSheet(
+                f"color:{C_GREEN if has_token else C_RED};"
+                f"background:transparent;font-weight:bold;font-size:12px;")
+        s("token_value", _mask_token(_ACCESS_TOKEN) if has_token else "─")
 
     # ── watchlist tables (overview + detail) ──────────────────────
     def _repaint_wl_tables(self, bars: dict):
