@@ -159,3 +159,49 @@ For multi-step tasks, state a brief plan:
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+## V9 — Multi-Broker (Webull ⇄ IBKR)
+
+V9 introduces a broker abstraction layer so the same strategy can run against either Webull or Interactive Brokers, with a one-click switch in the GUI toolbar. V8 is preserved untouched (tag `v8-baseline`).
+
+### V9 Files
+
+| File | Purpose |
+|---|---|
+| `webull_trading_bot_v9.py` | Bot main (V8 strategy verbatim, but talks to `brokers.BrokerAdapter` instead of `TradeClient`) |
+| `bot_gui_v9.py` | GUI dashboard with broker dropdown + Apply button |
+| `brokers/__init__.py` | `get_broker(name, paper)` factory |
+| `brokers/base.py` | `BrokerAdapter` ABC + market-hours helpers |
+| `brokers/proxies.py` | Unified `AccountProxy` / `PositionProxy` / `OrderProxy` / `ClockProxy` |
+| `brokers/webull_broker.py` | Webull SDK adapter |
+| `brokers/ibkr_broker.py` | IBKR (`ib_async`) adapter |
+| `settings.json` | `"broker"` key — `"webull"` or `"ibkr"` |
+| `.env` | Adds `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID` |
+
+### V9 Commands
+
+```powershell
+pip install ib_async                                                    # one-time, for IBKR
+python -X utf8 webull_trading_bot_v9.py                                 # trial (no API needed)
+python -X utf8 webull_trading_bot_v9.py --live                          # paper, broker from settings.json
+python -X utf8 webull_trading_bot_v9.py --live --broker ibkr            # IBKR paper (4002)
+python -X utf8 webull_trading_bot_v9.py --live --real --broker webull   # ⚠️ live trading
+python -X utf8 bot_gui_v9.py                                            # GUI with broker switch
+```
+
+### IBKR prerequisites (one-time)
+
+1. Install IB Gateway: https://www.interactivebrokers.com/en/trading/ibgateway-stable.php
+2. Log in with a paper trading account.
+3. In Gateway → Configure → API → Settings: tick **Enable ActiveX and Socket Clients**, ensure Socket port = 4002, untick **Read-Only API**.
+4. Add `127.0.0.1` to Trusted IPs.
+
+### GUI broker switch behaviour
+
+Toolbar dropdown lists `Webull` / `IBKR`. Clicking `套用` (Apply):
+1. If the bot subprocess is running, prompts to stop it.
+2. Disconnects the current broker (important for IBKR — releases `clientId=11`).
+3. Writes `broker` to `settings.json` so future restarts default to it.
+4. Triggers an immediate dashboard refresh — the new broker lazy-connects on first poll.
